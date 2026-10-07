@@ -334,8 +334,8 @@ const MODAL_BACKDROP = 0x0000008a
 
 fn modal(key: str, width: int, children: [El]) -> [El] {
     return [
-        portal(presence(key + "-backdrop", ENTER_FADE, box(st().at(0, 0, 0, 0).fill(MODAL_BACKDROP), []))),
-        portal(presence(key, ENTER_RISE, box(st().at(0 - 1, 0 - 1, 0 - 1, 0 - 1).w(width).fill(kit.surface).outline(kit.border, 1).round(16).pad(22).gapOf(12).shadowed(28), children)))
+        portal(exitFade(presence(key + "-backdrop", ENTER_FADE, box(st().at(0, 0, 0, 0).fill(MODAL_BACKDROP), [])))),
+        portal(exitRise(presence(key, ENTER_RISE, box(st().at(0 - 1, 0 - 1, 0 - 1, 0 - 1).w(width).fill(kit.surface).outline(kit.border, 1).round(16).pad(22).gapOf(12).shadowed(28), children))))
     ]
 }
 

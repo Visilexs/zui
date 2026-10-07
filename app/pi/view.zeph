@@ -636,22 +636,22 @@ fn welcomeView() -> El {
         if source == "skill" { skills += 1 } else if source == "prompt" { prompts += 1 } else { extensions += 1 }
     }
     var cards: [El] = [
-        welcomeCard(I_BOLT, "Commands", "Type / for commands, skills and templates", fn() {
+        presence("wc-commands", ENTER_RISE, welcomeCard(I_BOLT, "Commands", "Type / for commands, skills and templates", fn() {
             S.composer = "/"
             requestFocus("composer")
-        }),
-        welcomeCard(I_AT, "Files", "Type @ to reference a file in this folder", fn() {
+        })),
+        presence("wc-files", ENTER_RISE, welcomeCard(I_AT, "Files", "Type @ to reference a file in this folder", fn() {
             S.composer = "@"
             requestFocus("composer")
-        }),
-        welcomeCard(I_TERMINAL, "Shell", "Start with ! to run a command, !! to keep it private", fn() {
+        })),
+        presence("wc-shell", ENTER_RISE, welcomeCard(I_TERMINAL, "Shell", "Start with ! to run a command, !! to keep it private", fn() {
             S.composer = "!"
             requestFocus("composer")
-        })
+        }))
     ]
     if S.sessions.len() > 0 {
         let latest = S.sessions[0].path
-        cards.push(welcomeCard(I_HISTORY, "Resume", truncate(S.sessions[0].title, 60), fn() { openSession(latest) }))
+        cards.push(presence("wc-resume", ENTER_RISE, welcomeCard(I_HISTORY, "Resume", truncate(S.sessions[0].title, 60), fn() { openSession(latest) })))
     }
     return box(st().alignTo(CENTER).gapOf(10).padTo(0, 70, 0, 0), [
         box(st().w(64).h(64).round(18).fill(C_ACCENT).alignTo(CENTER).justifyTo(CENTER).shadowed(16), [label("π", F_TITLE, C_ON_ACCENT)]),
@@ -660,7 +660,7 @@ fn welcomeView() -> El {
         box(st().row().alignTo(CENTER).gapOf(8), [iconSmall(I_FOLDER, C_FAINT), label(shortPath(S.cwd), F_MONO, C_FAINT)]),
         label("{skills} skills · {prompts} prompt templates · {extensions} extension commands", F_SMALL, C_FAINT),
         gapBox(16),
-        box(st().row().gapOf(12).maxWidth(820), cards),
+        box(st().row().gapOf(12).maxWidth(820), stagger(50, cards)),
         gapBox(10),
         box(st().row().gapOf(16), [
             hintPair("Enter", "send"), hintPair("Shift+Enter", "new line"), hintPair("Ctrl+K", "commands"), hintPair("F1", "all shortcuts")
@@ -808,7 +808,7 @@ fn suggestionsView(items: [Suggestion]) -> El {
     rows.push(box(st().row().gapOf(14).padTo(10, 4, 10, 2), [
         label("↑↓ choose", F_SMALL, C_FAINT), label("Tab complete", F_SMALL, C_FAINT), label("Enter run", F_SMALL, C_FAINT), label("Esc dismiss", F_SMALL, C_FAINT)
     ]))
-    return presence("suggest", ENTER_RISE, box(st().fill(C_PANEL).outline(C_BORDER, 1).round(12).pad(6).gapOf(1).shadowed(18), rows))
+    return exitFade(presence("suggest", ENTER_RISE, box(st().fill(C_PANEL).outline(C_BORDER, 1).round(12).pad(6).gapOf(1).shadowed(18), rows)))
 }
 
 // ---- composer ----
@@ -1161,13 +1161,15 @@ fn listPanel() -> El {
         if item.detail != "" { texts.push(label(item.detail, F_SMALL, C_FAINT)) }
         var tail = label(item.hint, F_SMALL, C_FAINT)
         if item.active { tail = iconSmall(I_CHECK, C_ACCENT_HI) }
-        rows.push(clickable(st().row().alignTo(CENTER).gapOf(12).padXY(12, 9).round(9).fill(if selected { C_ACCENT_DIM } else { 0 }).hover(C_PANEL_HI), [
+        rows.push(presence("{item.label}·{item.detail}", ENTER_FADE, clickable(st().row().alignTo(CENTER).gapOf(12).padXY(12, 9).round(9).fill(if selected { C_ACCENT_DIM } else { 0 }).hover(C_PANEL_HI), [
             box(st().w(18), [iconSmall(item.glyph, if selected or item.active { C_ACCENT_HI } else { C_FAINT })]),
             box(st().flex(1).gapOf(2), texts),
             tail
-        ], item.action))
+        ], item.action)))
     }
     if items.len() == 0 { rows.push(box(st().padXY(12, 10), [label(if S.panel == "fork" or S.panel == "tree" { "Loading…" } else { "Nothing matches." }, F_SMALL, C_FAINT)])) }
+    // stagger(12): rows cascade in like a command palette; stable keys mean
+    // filtering only animates the rows that are new
     let field = input("panel-input", st().padXY(4, 4).fontOf(F_UI).fg(C_TEXT), S.panelQuery, if S.panel == "rename" { "Session name" } else { "Type to filter…" },
         fn(t: str) {
             S.panelQuery = t
@@ -1178,7 +1180,7 @@ fn listPanel() -> El {
         panelHeader(title, subtitle),
         box(st().row().alignTo(CENTER).gapOf(10).padXY(12, 8).round(10).fill(C_CODE_BG).outline(C_BORDER, 1), [iconSmall(if S.panel == "rename" { I_TAG } else { I_SEARCH }, C_FAINT), box(st().flex(1), [field])])
     ]
-    if S.panel != "rename" { body.push(scroll("panel-list", st().maxHeight(430).gapOf(2).padXY(2, 2), rows, false)) }
+    if S.panel != "rename" { body.push(scroll("panel-list", st().maxHeight(430).gapOf(2).padXY(2, 2), stagger(12, rows), false)) }
     if S.panel == "tree" {
         body.push(box(st().row().padXY(8, 4), [
             spacer(),

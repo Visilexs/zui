@@ -10,6 +10,108 @@ through `extern fn`, which needs a Zephyr compiler with Linux dynamic linking
 There is no browser engine. pi-desk uses no CPU while idle and about 60 MB PSS,
 most of which is the GPU driver.
 
+## zui
+
+```zephyr
+import "lib/ui.zeph"
+
+fn counter(ctx: Ctx) -> El {
+    let count = ctx.useInt(0)
+    return box(st().pad(24).gapOf(12), [
+        text("clicked {count.get()} times"),
+        clickable(st().padXY(14, 8).fill(0x3d59a1ff).hover(0x4d69b1ff).round(6),
+            [text("+1")], fn() { count.set(count.get() + 1) })
+    ])
+}
+
+fn main() {
+    zuiRun(App{title: "Counter", background: 0x1a1b26ff, render: counter,
+        setup: fn() { let f = fontOpen("sans-serif", sc(15)) }}, 480, 320)
+}
+```
+
+Build any program with `./build.sh <entry.zeph> <output> [-O2]`.
+
+### Components and state
+
+- Render functions return `El` trees.
+- Elements are reconciled against the previous render's retained instances,
+  by key or by tag and position.
+- Hooks (`useInt`, `useBool`, `useStr`) keep their state on those instances,
+  and setting a hook's value schedules a re-render. Code outside a component
+  calls `invalidate()` to do the same.
+
+### Elements
+
+- `box` and `row`/`col` lay out with a flexbox subset: direction, gap,
+  padding, fixed, min and max sizes, grow, align, justify, and absolute
+  overlays. `.wrapRows()` lets a row flow its children onto new lines when
+  they no longer fit, instead of squeezing them.
+- `text` and `rich` hold wrapped text built from styled spans.
+- `scroll` can stick to the bottom; set `centerShort = true` on it to centre
+  short content vertically (empty states) while it fits the viewport.
+- `input` is a multi-line editor.
+- `clickable` reacts to hover, press and click; `draggable` reports drags.
+- `canvas` paints itself with the drawing primitives (spinners, charts).
+
+### Motion and layers
+
+What CSS transitions, framer-motion and portals do in React:
+
+- Hover backgrounds cross-fade on their own.
+- `presence(key, ENTER_RISE, el)` fades an element in when it first appears
+  (`ENTER_FADE`, `ENTER_RISE`, `ENTER_DROP`).
+- `stagger(ms, els)` delays each child's enter by `i * ms` (list reveals).
+- `glide(el)` animates an element to its new layout position with spring
+  physics instead of jumping (switch knobs, tab indicators).
+- `exitFade(el)` / `exitRise(el)` / `exitDrop(el)` play a short fade-out
+  (170ms, rise/drop by 8px) when a keyed element leaves the tree, like
+  AnimatePresence — wrap the element, keep its key stable, and it keeps
+  drawing while it fades before being removed.
+- `faded(el, alpha)` draws a subtree translucent.
+- `withTip(el, "text")` shows a tooltip after the pointer rests on it.
+- `portal(el)` draws an element above everything, outside its ancestors'
+  clips, and gives it the pointer first (menus, popovers).
+- Animation only redraws (no re-render), and stops when nothing moves, so an
+  idle window still uses no CPU.
+
+`examples/motion.zeph` shows these; `examples/counter.zeph` is a minimal app.
+
+### Kit
+
+`lib/kit.zeph`, modelled on shadcn/ui, Radix, sonner, react-resizable-panels
+and react-rnd: `button` (primary, secondary, outline, ghost, danger),
+`iconBtn` with a tooltip, `tabs` with a gliding indicator, `switchToggle`,
+`checkbox`, `radioRow`, `slider`, `select`, `badge`, `kbdKeys`, `avatar`,
+`dot`, `progressBar`, `spinner`, `skeleton`, `card`, `alert`, `popover`,
+`toastCard` for sonner-style notifications, `menuItem`, `modal` for
+Radix-style dialogs, `splitter` for resizable panels and `resizeHandles`
+for resizable floating boxes. Colours and fonts come from the `kit` theme
+struct, which an app sets once. `examples/kit.zeph` shows them all:
+
+```sh
+./build.sh examples/kit.zeph build/kit && ./build/kit
+```
+
+### Rendering
+
+- Glyphs, anti-aliased rounded corners and fills share one texture atlas.
+- A frame is one `SDL_RenderGeometry` call per clip region, and the app only
+  redraws when something changes.
+
+### Files
+
+| path | what |
+|---|---|
+| `lib/ffi.zeph` | SDL3, FreeType, fontconfig and libc bindings |
+| `lib/gfx.zeph` | atlas, fonts with fallback, batched quads, clipping |
+| `lib/ui.zeph` | elements, reconciliation, hooks, layout, input, motion, tooltips, portals, the event loop |
+| `lib/kit.zeph` | ready-made components (buttons, tabs, switches, menus, spinners, splitters...) |
+| `lib/json.zeph` | JSON parser (never panics) and encoder |
+| `lib/proc.zeph` | child processes with non-blocking pipes |
+| `lib/hypr.zeph` | Hyprland IPC socket (backs the in-app windows below) |
+| `app/pi/` | pi-desk: theme, Markdown, the RPC session model, the view |
+
 ## pi-desk
 
 ```sh
@@ -65,8 +167,8 @@ terminal.
   - `/export` writes HTML, or a JSONL copy when the path ends in `.jsonl`.
   - `/compact [instructions]` and `/reload`.
 - **Models**
-  - a model picker (Ctrl+L or `/model`), Ctrl+P to cycle models, and
-    Shift+Tab to cycle thinking levels
+  - Model picker (Ctrl+L or `/model`), Ctrl+P cycles models, Shift+Tab
+    cycles thinking levels.
   - Switching to or from a local provider (`fable-local`, `ninfer-local`)
     restarts pi on the same session, so your wrapper starts the right model
     service.
@@ -96,28 +198,27 @@ terminal.
   entry to edit it in your editor or forget it, and **Add** starts a
   "Remember: …" prompt. `/memory` lists them in pi's terminal UI too.
 - **In-app windows (Hyprland):** windows opened by anything pi-desk started
-  (pi, its shell commands, a game, a browser, any GUI) show up in a frame
-  inside pi-desk instead of joining your desktop layout. Drag the title bar
-  to move the frame, any edge or corner to resize it, and double-click the
-  bar to maximize. Dragged near an edge or corner, it anchors there and
-  stays put as pi-desk resizes; the pin button picks a corner directly. The
-  size and anchor are saved to ~/.config/pi-desk/apps-frame. Several windows
-  become tabs, each with its app's icon and a close button. The buttons
-  minimize the frame to a small pill in its corner (click the pill or the
-  header's window button to bring it back), maximize it, move the window out
-  to the desktop, or close it. Closing pi-desk closes them too.
-  How it works: Wayland can't put one app's window inside another, so
-  pi-desk loads a small Lua hook into Hyprland (`hyprctl eval`). The hook
-  catches windows whose process descends from pi-desk before they map,
-  floats them, and keeps them glued over the frame. pi-desk is a child
-  subreaper, so a program pi starts in the background (`cmd &` from a shell
-  that then exits) still counts as its descendant. Apps that hand off to a
-  copy already running (an open Firefox, Steam) open there instead, and the
-  terminal and editor pi-desk opens on purpose stay normal windows.
-- **Layout:** drag the edge of the sidebar or the dock to resize it, and
-  pick how wide the conversation gets in `/settings` (Narrow, Medium, Wide
-  or Full; all saved to `~/.config/pi-desk/layout`). Icon buttons explain themselves in
-  tooltips, and panels, messages and toasts fade in.
+  (pi, its shell commands, a game, a browser) show up in a frame inside
+  pi-desk instead of joining your desktop layout. Drag the title bar to move
+  the frame, any edge or corner to resize it, double-click the bar to
+  maximize; dragged near an edge or corner it anchors there and stays put as
+  pi-desk resizes, and the pin button picks a corner directly. The size and
+  anchor are saved to `~/.config/pi-desk/apps-frame`. Several windows become
+  tabs, each with its app's icon and a close button; the buttons minimize the
+  frame to a pill in its corner (click the pill or the header's window button
+  to bring it back), maximize it, move the window out to the desktop, or
+  close it. Closing pi-desk closes them too. How it works: Wayland can't put
+  one app's window inside another, so pi-desk loads a small Lua hook into
+  Hyprland (`hyprctl eval`) that floats descendant windows and keeps them
+  over the frame; pi-desk is a child subreaper, so a program pi starts in
+  the background (`cmd &` from a shell that then exits) still counts. Apps
+  that hand off to a copy already running (an open Firefox, Steam) open there
+  instead, and the terminal and editor pi-desk opens on purpose stay normal
+  windows.
+- **Layout:** drag the edge of the sidebar or the dock to resize it, and pick
+  how wide the conversation gets in `/settings` (Narrow, Medium, Wide or
+  Full; all saved to `~/.config/pi-desk/layout`). Icon buttons explain
+  themselves in tooltips, and panels, messages and toasts fade in.
 - **Interface size:** set it in `/settings`, with Ctrl+= / Ctrl+− (saved to
   `~/.config/pi-desk/zoom`), or with `ZUI_SCALE=1.5`. Ctrl+0 or "Auto" goes
   back to automatic: 150% on 4K and 125% on 1440p-class heights, but only
@@ -126,101 +227,6 @@ terminal.
   notifications, status entries and widgets.
 - **Command palette (Ctrl+K):** every command and action. F1 lists the
   shortcuts.
-
-## zui
-
-```zephyr
-import "lib/ui.zeph"
-
-fn counter(ctx: Ctx) -> El {
-    let count = ctx.useInt(0)
-    return box(st().pad(24).gapOf(12), [
-        text("clicked {count.get()} times"),
-        clickable(st().padXY(14, 8).fill(0x3d59a1ff).hover(0x4d69b1ff).round(6),
-            [text("+1")], fn() { count.set(count.get() + 1) })
-    ])
-}
-
-fn main() {
-    zuiRun(App{title: "Counter", background: 0x1a1b26ff, render: counter,
-        setup: fn() { let f = fontOpen("sans-serif", sc(15)) }}, 480, 320)
-}
-```
-
-**Components and state**
-
-- Render functions return `El` trees.
-- Elements are reconciled against the previous render's retained instances,
-  by key or by tag and position.
-- Hooks (`useInt`, `useBool`, `useStr`) keep their state on those instances,
-  and setting a hook's value schedules a re-render. Code outside a component
-  calls `invalidate()` to do the same.
-
-**Elements**
-
-- `box` and `row`/`col` lay out with a flexbox subset: direction, gap,
-  padding, fixed, min and max sizes, grow, align, justify, and absolute
-  overlays. `.wrapRows()` lets a row flow its children onto new lines when
-  they no longer fit, instead of squeezing them.
-- `text` and `rich` hold wrapped text built from styled spans.
-- `scroll` can stick to the bottom; set `centerShort = true` on it to
-  centre short content vertically (empty states) while it fits the viewport.
-- `input` is a multi-line editor.
-- `clickable` reacts to hover, press and click; `draggable` reports drags.
-- `canvas` paints itself with the drawing primitives (spinners, charts).
-
-**Motion and layers** (what CSS transitions, framer-motion and portals do
-in React)
-
-- Hover backgrounds cross-fade on their own.
-- `presence(key, ENTER_RISE, el)` fades an element in when it first appears
-  (`ENTER_FADE`, `ENTER_RISE`, `ENTER_DROP`).
-- `stagger(ms, els)` delays each child's enter by `i * ms` (list reveals).
-- `glide(el)` animates an element to its new layout position with spring
-  physics instead of jumping (switch knobs, tab indicators).
-- `exitFade(el)` / `exitRise(el)` / `exitDrop(el)` play a short fade-out
-  (170ms, rise/drop by 8px) when a keyed element leaves the tree, like
-  AnimatePresence — wrap the element, keep its key stable, and it keeps
-  drawing while it fades before being removed.
-- `faded(el, alpha)` draws a subtree translucent.
-- `withTip(el, "text")` shows a tooltip after the pointer rests on it.
-- `portal(el)` draws an element above everything, outside its ancestors'
-  clips, and gives it the pointer first (menus, popovers).
-- Animation only redraws (no re-render), and stops when nothing moves, so an
-  idle window still uses no CPU.
-
-**Kit** (`lib/kit.zeph`, modelled on shadcn/ui, Radix, sonner,
-react-resizable-panels and react-rnd): `button` (primary, secondary,
-outline, ghost, danger), `iconBtn` with a tooltip, `tabs` with a gliding
-indicator, `switchToggle`, `checkbox`, `radioRow`, `slider`, `select`,
-`badge`, `kbdKeys`, `avatar`, `dot`, `progressBar`, `spinner`,
-`skeleton`, `card`, `alert`, `popover`, `toastCard` for sonner-style
-notifications, `menuItem`, `modal` for Radix-style dialogs, `splitter`
-for resizable panels and `resizeHandles` for resizable floating boxes.
-Colours and fonts come from the `kit` theme struct, which an app sets
-once. `examples/kit.zeph` shows them all:
-
-```sh
-./build.sh examples/kit.zeph build/kit && build/kit
-```
-
-**Rendering**
-
-- Glyphs, anti-aliased rounded corners and fills share one texture atlas.
-- A frame is one `SDL_RenderGeometry` call per clip region, and the app only
-  redraws when something changes.
-
-Files:
-
-| path | what |
-|---|---|
-| `lib/ffi.zeph` | SDL3, FreeType, fontconfig and libc bindings |
-| `lib/gfx.zeph` | atlas, fonts with fallback, batched quads, clipping |
-| `lib/ui.zeph` | elements, reconciliation, hooks, layout, input, motion, tooltips, portals, the event loop |
-| `lib/kit.zeph` | ready-made components (buttons, tabs, switches, menus, spinners, splitters...) |
-| `lib/json.zeph` | JSON parser (never panics) and encoder |
-| `lib/proc.zeph` | child processes with non-blocking pipes |
-| `app/pi/` | pi-desk: theme, Markdown, the RPC session model, the view |
 
 ## Testing
 

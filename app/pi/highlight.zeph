@@ -1,0 +1,369 @@
+// Syntax colouring for code blocks, file contents and shell commands: one
+// tokenizer for C-family, Python, shell, Rust, Zephyr, JS/TS, Go, Lua, SQL...
+// with per-language comment syntax and a shared keyword set. Results are
+// cached by (language, code).
+import "theme.zeph"
+
+// muted, distinct hues that sit with the slate theme
+const HL_KEYWORD = 0x8fa6e0ff        // blue
+const HL_STRING = 0xa9c4a0ff         // sage
+const HL_NUMBER = 0xd4b48cff         // sand
+const HL_COMMENT = 0x6b6b6eff
+const HL_FUNCTION = 0xe4e4e7ff
+const HL_TYPE = 0x8cc0c6ff           // teal
+const HL_PLAIN = 0xbebfc2ff
+const HL_PUNCT = 0x959598ff
+const HL_ADDED = 0xa5b1ceff
+const HL_REMOVED = 0x717275ff
+const HL_BUILTIN = 0xb4a2dcff        // lavender
+const HL_CONST = 0xd4b48cff
+const HL_ESCAPE = 0xd2a0b6ff         // rose: escapes and {interpolation}
+
+var hlKeywords: [str: bool] = [:]
+var hlCache: [str: [Span]] = [:]
+
+fn hlInit() {
+    for k in ["fn", "func", "function", "def", "class", "struct", "enum", "impl", "trait", "interface", "type",
+              "return", "if", "else", "elif", "for", "while", "loop", "do", "break", "continue", "match", "switch",
+              "case", "default", "let", "var", "const", "mut", "pub", "use", "import", "from", "export", "as",
+              "package", "module", "namespace", "new", "delete", "try", "catch", "except", "finally", "throw",
+              "raise", "async", "await", "yield", "in", "of", "is", "not", "and", "or", "with", "defer", "go",
+              "static", "public", "private", "protected", "extends", "implements", "super", "self", "this",
+              "true", "false", "null", "nil", "none", "None", "True", "False", "void", "int", "float", "bool",
+              "str", "string", "char", "auto", "unsafe", "where", "extern", "local", "then", "end", "fi", "done",
+              "esac", "echo", "cd", "export", "sudo", "select", "insert", "update", "where", "join", "into",
+              "values", "create", "table", "lambda", "pass", "assert", "typeof", "instanceof", "readonly"] { hlKeywords[k] = true }
+}
+
+fn hlCommentStyle(language: str) -> int {
+    // 0: // and /* */   1: #   2: --   3: none
+    let l = language.lower()
+    if l == "python" or l == "py" or l == "sh" or l == "bash" or l == "shell" or l == "zsh" or l == "fish" or l == "ruby" or l == "rb" or l == "yaml" or l == "yml" or l == "toml" or l == "perl" or l == "r" or l == "make" or l == "makefile" or l == "dockerfile" or l == "conf" or l == "ini" or l == "nix" { return 1 }
+    if l == "sql" or l == "lua" or l == "haskell" or l == "hs" { return 2 }
+    if l == "md" or l == "markdown" or l == "text" or l == "txt" or l == "json" or l == "" { return 3 }
+    return 0
+}
+
+// language from a path's extension, for file contents
+fn languageOfPath(path: str) -> str {
+    let dot = lastDot(path)
+    if dot < 0 { return "" }
+    let ext = path.sub(dot + 1, path.len()).lower()
+    if ext == "zeph" { return "zephyr" }
+    if ext == "rs" { return "rust" }
+    if ext == "py" { return "python" }
+    if ext == "sh" or ext == "bash" or ext == "zsh" { return "bash" }
+    if ext == "js" or ext == "mjs" or ext == "ts" or ext == "tsx" or ext == "jsx" { return "js" }
+    if ext == "md" { return "md" }
+    return ext
+}
+
+fn lastDot(t: str) -> int {
+    var i = t.len() - 1
+    while i >= 0 {
+        let b = t.byte(i)
+        if b == 46 { return i }
+        if b == 47 { return 0 - 1 }
+        i -= 1
+    }
+    return 0 - 1
+}
+
+fn hlIsIdent(b: int) -> bool { return (b >= 48 and b <= 57) or (b >= 65 and b <= 90) or (b >= 97 and b <= 122) or b == 95 }
+
+fn highlight(code: str, language: str, font: int) -> [Span] {
+    let key = language + "\0" + code
+    if let cached = hlCache.get(key) { return cached }
+    if hlKeywords.len() == 0 { hlInit() }
+    let spans = highlightUncached(code, language, font)
+    if hlCache.len() > 300 { hlCache = [:] }
+    hlCache[key] = spans
+    return spans
+}
+
+fn isZephyr(lang: str) -> bool { return lang == "zephyr" or lang == "zeph" or lang == "zp" }
+
+// an unlabeled code block that reads like Zephyr: fn declarations with typed
+// parameters or `->` returns, let/var, no semicolons at line ends
+fn looksLikeZephyr(code: str) -> bool {
+    if code.indexOf("fn ") < 0 and code.indexOf("let ") < 0 and code.indexOf("var ") < 0 { return false }
+    if code.indexOf(";\n") >= 0 or code.indexOf("function ") >= 0 or code.indexOf("def ") >= 0 or code.indexOf("func ") >= 0 { return false }
+    return code.indexOf(") -> ") >= 0 or code.indexOf(": int") >= 0 or code.indexOf(": str") >= 0 or code.indexOf(": float") >= 0 or code.indexOf("import \"") >= 0 or code.indexOf("print(") >= 0
+}
+
+fn highlightUncached(code: str, language: str, font: int) -> [Span] {
+    var spans: [Span] = []
+    let lang = language.lower()
+    if isZephyr(lang) or (lang == "" and looksLikeZephyr(code)) { return highlightZephyr(code, font) }
+    if lang == "diff" or lang == "patch" {
+        for i, line in code.split("\n") {
+            var color = HL_PLAIN
+            if line.startsWith("+") { color = HL_ADDED }
+            else if line.startsWith("-") { color = HL_REMOVED }
+            else if line.startsWith("@@") { color = HL_FUNCTION }
+            spans.push(Span{text: (if i > 0 { "\n" } else { "" }) + line, font: font, color: color})
+        }
+        return spans
+    }
+    let comments = hlCommentStyle(lang)
+    if lang == "md" or lang == "markdown" or lang == "text" or lang == "txt" {
+        spans.push(Span{text: code, font: font, color: HL_PLAIN})
+        return spans
+    }
+    let n = code.len()
+    var i = 0
+    var plainStart = 0
+    while i < n {
+        let b = code.byte(i)
+        var tokenEnd = 0 - 1
+        var color = 0
+        if comments == 0 and b == 47 and i + 1 < n and code.byte(i + 1) == 47 {
+            tokenEnd = hlLineEnd(code, i)
+            color = HL_COMMENT
+        } else if comments == 0 and b == 47 and i + 1 < n and code.byte(i + 1) == 42 {
+            let close = code.sub(i + 2, n).indexOf("*/")
+            tokenEnd = if close < 0 { n } else { i + 2 + close + 2 }
+            color = HL_COMMENT
+        } else if comments == 1 and b == 35 and (i == 0 or not hlIsIdent(code.byte(i - 1))) {
+            tokenEnd = hlLineEnd(code, i)
+            color = HL_COMMENT
+        } else if comments == 2 and b == 45 and i + 1 < n and code.byte(i + 1) == 45 {
+            tokenEnd = hlLineEnd(code, i)
+            color = HL_COMMENT
+        } else if b == 34 or b == 39 or b == 96 {
+            // a string: to the matching quote on the same line (backticks may span lines)
+            var j = i + 1
+            while j < n and code.byte(j) != b and (code.byte(j) != 10 or b == 96) {
+                if code.byte(j) == 92 { j += 1 }
+                j += 1
+            }
+            tokenEnd = min(j + 1, n)
+            color = HL_STRING
+            // an apostrophe inside a word (don't) is not a string
+            if b == 39 and i > 0 and hlIsIdent(code.byte(i - 1)) { tokenEnd = 0 - 1 }
+        } else if b >= 48 and b <= 57 and (i == 0 or not hlIsIdent(code.byte(i - 1))) {
+            var j = i
+            while j < n and (hlIsIdent(code.byte(j)) or code.byte(j) == 46) { j += 1 }
+            tokenEnd = j
+            color = HL_NUMBER
+        } else if hlIsIdent(b) and (i == 0 or not hlIsIdent(code.byte(i - 1))) {
+            var j = i
+            while j < n and hlIsIdent(code.byte(j)) { j += 1 }
+            let word = code.sub(i, j)
+            var k = j
+            while k < n and code.byte(k) == 32 { k += 1 }
+            if hlKeywords.has(word) { color = HL_KEYWORD }
+            else if k < n and code.byte(k) == 40 { color = HL_FUNCTION }
+            else if b >= 65 and b <= 90 and word.len() > 1 { color = HL_TYPE }
+            if color != 0 { tokenEnd = j } else { i = j }
+            if color == 0 { continue }
+        }
+        if tokenEnd > i {
+            if i > plainStart { spans.push(Span{text: code.sub(plainStart, i), font: font, color: HL_PLAIN}) }
+            spans.push(Span{text: code.sub(i, tokenEnd), font: font, color: color})
+            i = tokenEnd
+            plainStart = i
+            continue
+        }
+        i += 1
+    }
+    if n > plainStart { spans.push(Span{text: code.sub(plainStart, n), font: font, color: HL_PLAIN}) }
+    if spans.len() == 0 { spans.push(Span{text: "", font: font, color: HL_PLAIN}) }
+    return spans
+}
+
+fn hlLineEnd(code: str, from: int) -> int {
+    var j = from
+    while j < code.len() and code.byte(j) != 10 { j += 1 }
+    return j
+}
+
+// ---- Zephyr ----
+// The language's own tokens (docs/spec.md §1.1): nested block comments,
+// "…" strings with {interpolation} and escapes, raw r"…" and multi-line
+// """…""" strings, 'c' byte literals, 0x/0b/0o and _-separated numbers,
+// keywords, built-in types and functions, ALL_CAPS constants.
+
+var zpKeywords: [str: bool] = [:]
+var zpTypes: [str: bool] = [:]
+var zpBuiltins: [str: bool] = [:]
+
+fn zpInit() {
+    for k in ["fn", "let", "var", "const", "if", "else", "while", "for", "in", "return", "struct", "enum", "impl",
+              "interface", "import", "as", "extern", "from", "true", "false", "none", "and", "or", "not", "break",
+              "continue", "match", "defer", "private", "type", "test", "step", "self"] { zpKeywords[k] = true }
+    for k in ["int", "float", "bool", "str", "void", "i32", "u8", "f32", "f64", "Self"] { zpTypes[k] = true }
+    for k in ["print", "panic", "sqrt", "emit", "chr", "bits", "floatFromBits", "args", "readFile", "writeFile",
+              "zeros", "assert", "abs", "min", "max", "pow", "len", "push", "pop", "byte", "sub", "join", "split",
+              "contains", "indexOf", "startsWith", "endsWith", "replace", "upper", "lower", "trim", "repeat", "sort",
+              "syscall", "addr", "load8", "load16", "load32", "load64", "store8", "store16", "store32", "store64",
+              "callPointer", "callSysV", "callSysVFloat", "dynamicImport", "stackPointer", "spawnThread",
+              "parallelFor", "cpuCount", "nativeAlloc", "cstr", "envVar", "has", "get", "or", "keys", "remove"] { zpBuiltins[k] = true }
+}
+
+fn zpPush(spans: [Span], text: str, font: int, color: int) {
+    if text == "" { return }
+    spans.push(Span{text: text, font: font, color: color})
+}
+
+fn highlightZephyr(code: str, font: int) -> [Span] {
+    if zpKeywords.len() == 0 { zpInit() }
+    var spans: [Span] = []
+    zpTokens(code, font, spans)
+    if spans.len() == 0 { spans.push(Span{text: "", font: font, color: HL_PLAIN}) }
+    return spans
+}
+
+fn zpTokens(code: str, font: int, spans: [Span]) {
+    let n = code.len()
+    var i = 0
+    var plainStart = 0
+    var afterFn = false                      // the next identifier names a function
+    while i < n {
+        let b = code.byte(i)
+        let next = if i + 1 < n { code.byte(i + 1) } else { 0 }
+        var end = 0 - 1
+        var color = 0
+        if b == 47 and next == 47 {
+            end = hlLineEnd(code, i)
+            color = HL_COMMENT
+        } else if b == 47 and next == 42 {
+            // block comments nest
+            var depth = 1
+            var j = i + 2
+            while j < n and depth > 0 {
+                if code.byte(j) == 47 and j + 1 < n and code.byte(j + 1) == 42 {
+                    depth += 1
+                    j += 2
+                } else if code.byte(j) == 42 and j + 1 < n and code.byte(j + 1) == 47 {
+                    depth -= 1
+                    j += 2
+                } else {
+                    j += 1
+                }
+            }
+            end = j
+            color = HL_COMMENT
+        } else if b == 34 or (b == 114 and next == 34 and (i == 0 or not hlIsIdent(code.byte(i - 1)))) {
+            zpPush(spans, code.sub(plainStart, i), font, HL_PLAIN)
+            i = zpString(code, i, font, spans)
+            plainStart = i
+            afterFn = false
+            continue
+        } else if b == 39 and (i == 0 or not hlIsIdent(code.byte(i - 1))) {
+            // 'a', '\n', '\x1b'
+            var j = i + 1
+            if j < n and code.byte(j) == 92 { j += 2 } else { j += 1 }
+            while j < n and code.byte(j) != 39 and code.byte(j) != 10 and j - i < 6 { j += 1 }
+            if j < n and code.byte(j) == 39 {
+                end = j + 1
+                color = HL_STRING
+            }
+        } else if b >= 48 and b <= 57 and (i == 0 or not hlIsIdent(code.byte(i - 1))) {
+            var j = i
+            while j < n and (hlIsIdent(code.byte(j)) or (code.byte(j) == 46 and j + 1 < n and code.byte(j + 1) >= 48 and code.byte(j + 1) <= 57)) { j += 1 }
+            // an exponent sign: 2.5E-3
+            if j < n and (code.byte(j) == 45 or code.byte(j) == 43) and j > i and (code.byte(j - 1) == 101 or code.byte(j - 1) == 69) and code.sub(i, min(i + 2, n)) != "0x" {
+                j += 1
+                while j < n and hlIsIdent(code.byte(j)) { j += 1 }
+            }
+            end = j
+            color = HL_NUMBER
+        } else if hlIsIdent(b) and (i == 0 or not hlIsIdent(code.byte(i - 1))) {
+            var j = i
+            while j < n and hlIsIdent(code.byte(j)) { j += 1 }
+            let word = code.sub(i, j)
+            var k = j
+            while k < n and code.byte(k) == 32 { k += 1 }
+            let call = k < n and code.byte(k) == 40
+            let method = i > 0 and code.byte(i - 1) == 46
+            if afterFn {
+                color = HL_FUNCTION
+                afterFn = false
+            } else if zpKeywords.has(word) and not method {
+                color = HL_KEYWORD
+                afterFn = word == "fn"
+            } else if zpTypes.has(word) { color = HL_TYPE }
+            else if call and zpBuiltins.has(word) { color = HL_BUILTIN }
+            else if call { color = HL_FUNCTION }
+            else if b >= 65 and b <= 90 and word.len() > 1 and word.upper() == word { color = HL_CONST }
+            else if b >= 65 and b <= 90 { color = HL_TYPE }
+            if color == 0 {
+                i = j
+                continue
+            }
+            end = j
+        } else if b == 45 and next == 62 {
+            end = i + 2                              // ->
+            color = HL_PUNCT
+        } else if b == 63 or b == 46 and next == 46 {
+            end = i + (if b == 46 { 2 } else { 1 })  // ? ..
+            color = HL_KEYWORD
+        }
+        if end > i {
+            zpPush(spans, code.sub(plainStart, i), font, HL_PLAIN)
+            zpPush(spans, code.sub(i, end), font, color)
+            i = end
+            plainStart = i
+            continue
+        }
+        if b != 32 and b != 9 and b != 10 { afterFn = afterFn and b == 60 }   // fn name<T>: keep waiting only through generics
+        i += 1
+    }
+    zpPush(spans, code.sub(plainStart, n), font, HL_PLAIN)
+}
+
+// a string literal starting at `from`; returns the index after it
+fn zpString(code: str, from: int, font: int, spans: [Span]) -> int {
+    let n = code.len()
+    var i = from
+    let raw = code.byte(i) == 114
+    if raw { i += 1 }
+    let triple = i + 2 < n and code.sub(i, i + 3) == "\"\"\""
+    i += if triple { 3 } else { 1 }
+    var segStart = from
+    while i < n {
+        let b = code.byte(i)
+        if triple and b == 34 and i + 2 < n and code.sub(i, i + 3) == "\"\"\"" {
+            zpPush(spans, code.sub(segStart, i + 3), font, HL_STRING)
+            return i + 3
+        }
+        if not triple and b == 34 {
+            zpPush(spans, code.sub(segStart, i + 1), font, HL_STRING)
+            return i + 1
+        }
+        if not triple and b == 10 { break }                     // unterminated
+        if not raw and b == 92 and i + 1 < n {
+            // an escape: \n \{ \xNN
+            zpPush(spans, code.sub(segStart, i), font, HL_STRING)
+            var e = i + 2
+            if code.byte(i + 1) == 120 { e = min(i + 4, n) }
+            zpPush(spans, code.sub(i, e), font, HL_ESCAPE)
+            i = e
+            segStart = i
+            continue
+        }
+        if not raw and b == 123 {
+            // {interpolation}: highlighted as code
+            var depth = 1
+            var j = i + 1
+            while j < n and depth > 0 and code.byte(j) != 10 {
+                if code.byte(j) == 123 { depth += 1 }
+                if code.byte(j) == 125 { depth -= 1 }
+                if depth > 0 { j += 1 }
+            }
+            if depth == 0 {
+                zpPush(spans, code.sub(segStart, i), font, HL_STRING)
+                zpPush(spans, "\{", font, HL_ESCAPE)
+                zpTokens(code.sub(i + 1, j), font, spans)
+                zpPush(spans, "\}", font, HL_ESCAPE)
+                i = j + 1
+                segStart = i
+                continue
+            }
+        }
+        i += 1
+    }
+    zpPush(spans, code.sub(segStart, i), font, HL_STRING)
+    return i
+}

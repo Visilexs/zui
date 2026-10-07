@@ -1,0 +1,125 @@
+// Colours (0xRRGGBBAA) and fonts.
+import "../../lib/kit.zeph"
+import "icons.zeph"
+
+// three colours: the charcoal base, soft white text, a muted slate accent;
+// everything else is a blend of them
+const C_BG = 0x131417ff
+const C_SIDEBAR = 0x0e0f11ff
+const C_PANEL = 0x1d1e21ff
+const C_PANEL_HI = 0x26272aff
+const C_PANEL_TOP = 0x2e2f32ff
+const C_CODE_BG = 0x0c0d0fff
+const C_BORDER = 0x303134ff
+const C_TEXT = 0xe4e4e7ff
+const C_TEXT_SOFT = 0xc7c7caff
+const C_HEADING = 0xe4e4e7ff
+const C_MUTED = 0x959598ff
+const C_FAINT = 0x6b6b6eff
+const C_ACCENT = 0x8a9bc4ff
+const C_ACCENT_HI = 0xa5b1ceff
+const C_ACCENT_DIM = 0x8a9bc422
+const C_ACCENT_SOFT = 0x8a9bc440
+const C_ON_ACCENT = 0x131417ff
+const C_USER_BG = 0x21242cff
+const C_USER_BORDER = 0x303441ff
+const C_GOOD = 0x8a9bc4ff
+const C_BAD = 0xe4e4e7ff
+const C_BAD_BG = 0xe4e4e70a
+const C_BAD_SOFT = 0xe4e4e720
+const C_WARN = 0xa5b1ceff
+const C_INFO = 0x959598ff
+const C_INFO_SOFT = 0xe4e4e71c
+const C_INFO_BG = 0xe4e4e712
+const C_LINK = 0xa5b1ceff
+const C_CODE_INLINE = 0xa5b1ceff
+const C_CODE_INLINE_BG = 0x8a9bc41f
+const C_DIFF_ADD = 0x262a33ff
+const C_DIFF_DEL = 0x1d1e21ff
+const C_DIFF_ADD_TEXT = 0xa5b1ceff
+const C_DIFF_DEL_TEXT = 0x717275ff
+const C_SHADE = 0x000000a0
+
+var F_UI = 0
+var F_UI_BOLD = 0
+var F_UI_ITALIC = 0
+var F_SMALL = 0
+var F_SMALL_BOLD = 0
+var F_H1 = 0
+var F_H2 = 0
+var F_MONO = 0
+var F_MONO_BOLD = 0
+var F_MONO_SMALL = 0
+var F_ICON = 0
+var F_ICON_SMALL = 0
+var F_ICON_BIG = 0
+var F_TITLE = 0
+
+fn openFonts() {
+    F_UI = fontOpen("sans-serif", sc(14))           // font 0: the default
+    F_UI_BOLD = fontOpen("sans-serif:bold", sc(14))
+    F_UI_ITALIC = fontOpen("sans-serif:italic", sc(14))
+    F_SMALL = fontOpen("sans-serif", sc(12))
+    F_SMALL_BOLD = fontOpen("sans-serif:bold", sc(12))
+    F_H1 = fontOpen("sans-serif:bold", sc(19))
+    F_H2 = fontOpen("sans-serif:bold", sc(16))
+    F_MONO = fontOpen("monospace", sc(13))
+    F_MONO_BOLD = fontOpen("monospace:bold", sc(13))
+    F_MONO_SMALL = fontOpen("monospace", sc(12))
+    F_ICON = fontOpen("Symbols Nerd Font,MesloLGM Nerd Font,MesloLGS Nerd Font", sc(15))
+    F_ICON_SMALL = fontOpen("Symbols Nerd Font,MesloLGM Nerd Font,MesloLGS Nerd Font", sc(13))
+    F_ICON_BIG = fontOpen("Symbols Nerd Font,MesloLGM Nerd Font,MesloLGS Nerd Font", sc(30))
+    F_TITLE = fontOpen("sans-serif:bold", sc(28))
+    focusBorder = C_ACCENT
+    selectionColor = 0x8a9bc450
+    caretColor = C_ACCENT_HI
+    placeholderColor = C_FAINT
+    scrollbarColor = 0xffffff26
+    selectionFill = 0x8a9bc448
+    tipFont = F_SMALL
+    tipBg = C_PANEL_TOP
+    tipFg = C_TEXT
+    tipBorder = 0xffffff14
+    kit = KitTheme{bg: C_BG, surface: C_PANEL, surfaceHi: C_PANEL_HI, surfaceTop: C_PANEL_TOP, border: C_BORDER, hairline: 0xffffff0f,
+        text: C_TEXT, textSoft: C_TEXT_SOFT, muted: C_MUTED, faint: C_FAINT, accent: C_ACCENT, accentHi: C_ACCENT_HI,
+        accentDim: C_ACCENT_DIM, accentSoft: C_ACCENT_SOFT, onAccent: C_ON_ACCENT, good: C_GOOD, warn: C_WARN, bad: C_BAD, info: C_INFO,
+        font: F_UI, fontBold: F_UI_BOLD, fontSmall: F_SMALL, fontSmallBold: F_SMALL_BOLD, fontMono: F_MONO, fontIcon: F_ICON, fontIconSmall: F_ICON_SMALL}
+}
+
+fn icon(glyph: str, color: int) -> El { return unselectable(label(glyph, F_ICON, color)) }
+fn iconSmall(glyph: str, color: int) -> El { return unselectable(label(glyph, F_ICON_SMALL, color)) }
+
+fn unselectable(el: El) -> El {
+    el.selectable = false
+    return el
+}
+
+// the CLI shows the thinking level as the editor border colour
+fn thinkingColor(level: str) -> int {
+    if level == "minimal" or level == "low" { return C_FAINT }
+    if level == "medium" { return C_MUTED }
+    if level == "high" or level == "xhigh" or level == "max" { return C_ACCENT }
+    return C_BORDER
+}
+
+// a square icon button with a hover state (kit.iconBtn adds the tooltip)
+fn iconButton(glyph: str, color: int, onClick: fn()) -> El {
+    return clickable(st().w(30).h(30).round(8).alignTo(CENTER).justifyTo(CENTER).hover(C_PANEL_HI), [icon(glyph, color)], onClick)
+}
+
+fn toggle(on: bool, onClick: fn()) -> El { return switchToggle(on, onClick) }
+
+fn kbd(keys: str) -> El { return kbdKeys(keys) }
+
+fn label(content: str, font: int, color: int) -> El {
+    return textStyled(st().fontOf(font).fg(color), content)
+}
+
+// a small rounded button
+fn chip(content: str, onClick: fn()) -> El {
+    return clickable(st().padXY(10, 5).fill(C_PANEL).hover(C_PANEL_HI).round(6), [label(content, F_SMALL, C_MUTED)], onClick)
+}
+
+fn primaryButton(content: str, onClick: fn()) -> El { return button(content, BTN_PRIMARY, onClick) }
+
+fn ghostButton(content: str, onClick: fn()) -> El { return button(content, BTN_OUTLINE, onClick) }

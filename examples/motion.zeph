@@ -1,0 +1,37 @@
+// Motion primitives: staggered enters, spring glide, exit transitions.
+//   ./build.sh examples/motion.zeph build/motion && build/motion
+import "../lib/kit.zeph"
+
+fn gallery(ctx: Ctx) -> El {
+    let bye = ctx.useBool(true)
+    var cards: [El] = []
+    for i in 0..3 {
+        cards.push(presence("c{i}", ENTER_RISE, card(st().padXY(14, 10), [kitLabel("Card {i + 1}", kit.font, kit.text)])))
+    }
+    var byeCard: [El] = []
+    if bye.flag() { byeCard.push(exitRise(presence("bye", ENTER_RISE, box(st().padXY(14, 10).fill(0xFF5B6F9E).round(10), [kitLabel("Bye bye", kit.font, 0xFFFFFFFF)])))) }
+    return box(st().col().pad(24).gapOf(22).maxWidth(560), [
+        kitLabel("MOTION", kit.fontSmallBold, kit.faint),
+        kitLabel("Cards above entered with a 60ms stagger.", kit.fontSmall, kit.muted),
+        box(st().row().gapOf(8).wrapRows(), stagger(60, cards)),
+        box(st().row().gapOf(12).alignTo(CENTER).wrapRows(), [
+            button(if bye.flag() { "Bring back" } else { "Dismiss card" }, BTN_OUTLINE, fn() { bye.toggle() }),
+            box(st().row().gapOf(8), byeCard)
+        ]),
+        kitLabel("The dismissed card plays an exit transition before leaving the tree.", kit.fontSmall, kit.faint)
+    ])
+}
+
+fn main() {
+    zuiRun(App{title: "zui motion", background: kit.bg, render: fn(ctx: Ctx) -> El { return component("motion", gallery) }, setup: fn() {
+        let icons = "Symbols Nerd Font,MesloLGM Nerd Font,MesloLGS Nerd Font"
+        kit.font = fontOpen("sans-serif", sc(14))
+        kit.fontBold = fontOpen("sans-serif:bold", sc(14))
+        kit.fontSmall = fontOpen("sans-serif", sc(12))
+        kit.fontSmallBold = fontOpen("sans-serif:bold", sc(12))
+        kit.fontMono = fontOpen("monospace", sc(13))
+        kit.fontIcon = fontOpen(icons, sc(15))
+        kit.fontIconSmall = fontOpen(icons, sc(13))
+        tipFont = kit.fontSmall
+    }}, 720, 560)
+}

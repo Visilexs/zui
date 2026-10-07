@@ -1,0 +1,227 @@
+// Filesystem helpers for the composer: a project file index for @-search,
+// Tab path completion, and base64 for image attachments. Directory reads use
+// getdents64 directly so an unreadable folder is skipped instead of fatal.
+import "../../lib/ffi.zeph"
+
+struct DirEntry { name: str, isDir: bool }
+
+var direntBuffer = 0
+
+fn readDir(path: str) -> [DirEntry] {
+    var out: [DirEntry] = []
+    let fd = syscall(2, cstr(path), 65536 | 524288, 0)     // open O_DIRECTORY | O_CLOEXEC
+    if fd < 0 { return out }
+    if direntBuffer == 0 { direntBuffer = nativeAlloc(32768) }
+    while true {
+        let n = syscall(217, fd, direntBuffer, 32768)
+        if n <= 0 { break }
+        var offset = 0
+        while offset < n {
+            let record = direntBuffer + offset
+            let length = load16(record + 16)
+            let kind = load8(record + 18)
+            let name = strFromC(record + 19)
+            if name != "." and name != ".." {
+                var isDir = kind == 4
+                if kind == 10 or kind == 0 { isDir = isDirectory(path + "/" + name) }   // symlink / unknown
+                out.push(DirEntry{name: name, isDir: isDir})
+            }
+            offset += length
+            if length == 0 { break }
+        }
+    }
+    syscall(3, fd)
+    return out
+}
+
+fn isDirectory(path: str) -> bool {
+    let st = cstrIn(2, " ".repeat(160))
+    if syscall(4, cstr(path), st) != 0 { return false }      // stat follows links
+    return (load32(st + 24) & 61440) == 16384
+}
+
+fn isFile(path: str) -> bool {
+    let st = cstrIn(2, " ".repeat(160))
+    if syscall(4, cstr(path), st) != 0 { return false }
+    return (load32(st + 24) & 61440) == 32768
+}
+
+// ---- the project index ----
+
+var fileIndex: [str] = []
+var fileIndexRoot = ""
+var fileIndexTime = 0
+
+fn skipDir(name: str) -> bool {
+    if name.startsWith(".") { return true }
+    return name == "node_modules" or name == "target" or name == "dist" or name == "build" or name == "__pycache__" or name == "venv" or name == "vendor" or name == "out"
+}
+
+fn indexFiles(root: str, now: int) {
+    if root == fileIndexRoot and now - fileIndexTime < 30000 { return }
+    fileIndexRoot = root
+    fileIndexTime = now
+    var found: [str] = []
+    var queue: [str] = [""]
+    var head = 0
+    while head < queue.len() and found.len() < 20000 {
+        let relative = queue[head]
+        head += 1
+        let absolute = if relative == "" { root } else { root + "/" + relative }
+        for entry in readDir(absolute) {
+            let path = if relative == "" { entry.name } else { relative + "/" + entry.name }
+            if entry.isDir {
+                if not skipDir(entry.name) and queue.len() < 4000 {
+                    queue.push(path)
+                    found.push(path + "/")
+                }
+            } else {
+                found.push(path)
+            }
+        }
+    }
+    fileIndex = found
+}
+
+fn lowerByte(b: int) -> int { return if b >= 65 and b <= 90 { b + 32 } else { b } }
+
+// fuzzy score of `query` against `candidate` (higher is better, -1: no match):
+// characters must appear in order; contiguous runs, word starts and a match in
+// the file name score extra
+fn fuzzyScore(query: str, candidate: str) -> int {
+    if query == "" { return 1 }
+    var score = 0
+    var qi = 0
+    var previous = 0 - 2
+    let nameStart = lastSlash(candidate.sub(0, max(candidate.len() - 1, 0))) + 1
+    for ci in 0..candidate.len() {
+        if qi >= query.len() { break }
+        let c = lowerByte(candidate.byte(ci))
+        if c == lowerByte(query.byte(qi)) {
+            score += 1
+            if previous == ci - 1 { score += 4 }
+            if ci == 0 or candidate.byte(ci - 1) == 47 or candidate.byte(ci - 1) == 95 or candidate.byte(ci - 1) == 45 or candidate.byte(ci - 1) == 46 { score += 3 }
+            if ci >= nameStart { score += 1 }
+            previous = ci
+            qi += 1
+        }
+    }
+    if qi < query.len() { return 0 - 1 }
+    return score * 100 - candidate.len()
+}
+
+// best `limit` index entries for a query
+fn searchFiles(query: str, limit: int) -> [str] {
+    var scored: [(int, str)] = []
+    for path in fileIndex {
+        let s = fuzzyScore(query, path)
+        if s >= 0 { scored.push((s, path)) }
+    }
+    // partial selection sort: we only need the top few
+    var out: [str] = []
+    var used: [bool] = []
+    for item in scored { used.push(false) }
+    for k in 0..min(limit, scored.len()) {
+        var best = 0 - 1
+        for i, item in scored {
+            if not used[i] and (best < 0 or item.0 > scored[best].0) { best = i }
+        }
+        used[best] = true
+        out.push(scored[best].1)
+    }
+    return out
+}
+
+// ---- path completion ----
+
+// entries completing `partial` (relative to cwd unless absolute or ~)
+fn completePath(partial: str, cwd: str, home: str) -> [str] {
+    var expanded = partial
+    if partial.startsWith("~/") { expanded = home + partial.sub(1, partial.len()) }
+    let slash = lastSlash(expanded)
+    let directoryPart = if slash < 0 { "" } else { expanded.sub(0, slash + 1) }
+    let prefix = if slash < 0 { expanded } else { expanded.sub(slash + 1, expanded.len()) }
+    var base = directoryPart
+    if not directoryPart.startsWith("/") { base = cwd + "/" + directoryPart }
+    var matches: [str] = []
+    for entry in readDir(base) {
+        if entry.name.startsWith(prefix) and (prefix.startsWith(".") or not entry.name.startsWith(".")) {
+            let shownDirectory = if slash < 0 { "" } else { partial.sub(0, partial.len() - prefix.len()) }
+            matches.push(shownDirectory + entry.name + (if entry.isDir { "/" } else { "" }))
+        }
+    }
+    matches.sort()
+    return matches
+}
+
+fn lastSlash(t: str) -> int {
+    var i = t.len() - 1
+    while i >= 0 {
+        if t.byte(i) == 47 { return i }
+        i -= 1
+    }
+    return 0 - 1
+}
+
+fn commonPrefix(items: [str]) -> str {
+    if items.len() == 0 { return "" }
+    var prefix = items[0]
+    for item in items {
+        var n = 0
+        while n < prefix.len() and n < item.len() and prefix.byte(n) == item.byte(n) { n += 1 }
+        prefix = prefix.sub(0, n)
+    }
+    return prefix
+}
+
+// ---- base64 ----
+
+fn base64(data: str) -> str {
+    let alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+    var out: [u8] = []
+    let n = data.len()
+    var i = 0
+    while i + 2 < n {
+        let v = (data.byte(i) << 16) | (data.byte(i + 1) << 8) | data.byte(i + 2)
+        out.push(alphabet.byte((v >> 18) & 63))
+        out.push(alphabet.byte((v >> 12) & 63))
+        out.push(alphabet.byte((v >> 6) & 63))
+        out.push(alphabet.byte(v & 63))
+        i += 3
+    }
+    if n - i == 1 {
+        let v = data.byte(i) << 16
+        out.push(alphabet.byte((v >> 18) & 63))
+        out.push(alphabet.byte((v >> 12) & 63))
+        out.push(61)
+        out.push(61)
+    } else if n - i == 2 {
+        let v = (data.byte(i) << 16) | (data.byte(i + 1) << 8)
+        out.push(alphabet.byte((v >> 18) & 63))
+        out.push(alphabet.byte((v >> 12) & 63))
+        out.push(alphabet.byte((v >> 6) & 63))
+        out.push(61)
+    }
+    return out as str
+}
+
+fn imageMime(path: str) -> str {
+    let lower = path.lower()
+    if lower.endsWith(".png") { return "image/png" }
+    if lower.endsWith(".jpg") or lower.endsWith(".jpeg") { return "image/jpeg" }
+    if lower.endsWith(".gif") { return "image/gif" }
+    if lower.endsWith(".webp") { return "image/webp" }
+    return ""
+}
+
+fn baseName(path: str) -> str {
+    let slash = lastSlash(path)
+    if slash < 0 { return path }
+    return path.sub(slash + 1, path.len())
+}
+
+fn fileSize(path: str) -> int {
+    let st = cstrIn(2, " ".repeat(160))
+    if syscall(4, cstr(path), st) != 0 { return 0 }
+    return load64(st + 48)
+}

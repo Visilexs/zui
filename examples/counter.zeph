@@ -1,0 +1,35 @@
+import "../lib/ui.zeph"
+
+var sans = 0
+var bold = 0
+
+fn counter(ctx: Ctx) -> El {
+    let count = ctx.useInt(0)
+    let note = ctx.useStr("")
+    return box(st().pad(24).gapOf(16).fill(0x1a1b26ff), [
+        textStyled(st().fontOf(bold).fg(0xc0caf5ff), "zui counter"),
+        textStyled(st().fg(0xa9b1d6ff), "Clicked {count.get()} times. A longer sentence to check that wrapping works when the window gets narrow, with ünïcödé and → arrows."),
+        box(st().row().gapOf(8), [
+            clickable(st().padXY(14, 8).fill(0x3d59a1ff).hover(0x4d69b1ff).press(0x2d4991ff).round(6), [
+                textStyled(st().fg(0xffffffff), "+1")
+            ], fn() { count.set(count.get() + 1) }),
+            clickable(st().padXY(14, 8).fill(0x2f334dff).hover(0x3b4061ff).round(6), [
+                textStyled(st().fg(0xc0caf5ff), "Reset")
+            ], fn() { count.set(0) })
+        ]),
+        withAutofocus(input("note", st().pad(10).fill(0x16161eff).outline(0x3b4261ff, 1).round(8).fg(0xc0caf5ff).maxHeight(160), note.get(), "Type something…", fn(t: str) { note.set(t) }, fn(t: str) { note.set("") })),
+        textStyled(st().fg(0x7982a9ff), "You typed {note.get().len()} bytes")
+    ])
+}
+
+fn withAutofocus(el: El) -> El {
+    el.autofocus = true
+    return el
+}
+
+fn main() {
+    zuiRun(App{title: "zui counter", background: 0x1a1b26ff, render: counter, setup: fn() {
+        sans = fontOpen("sans-serif", sc(15))
+        bold = fontOpen("sans-serif:bold", sc(20))
+    }}, 520, 360)
+}

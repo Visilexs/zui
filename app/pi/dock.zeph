@@ -1,0 +1,493 @@
+// The right-hand dock. "Context" breaks the context window down by what fills
+// it; "File" follows the file pi is reading or writing and shows its edits
+// streaming in, in place, as the model types them.
+import "view.zeph"
+import "embed.zeph"
+import "memory.zeph"
+
+// the width the user dragged it to (500 to start), but never more than 60% of
+// the window; when that would leave the conversation too narrow, the dock
+// floats over it instead
+fn dockOverlay() -> bool { return viewW - max(min(dockPref, viewW * 3 / 5), 300) - 1 < 560 }
+fn dockWidth() -> int {
+    if dockOverlay() { return min(dockPref, viewW) }
+    return max(min(dockPref, viewW * 3 / 5), 300)
+}
+// the space the dock takes from the conversation
+fn dockSpace() -> int { return if S.dock == "" or dockOverlay() { 0 } else { dockWidth() + 1 } }
+const LIVE_WINDOW = 300            // lines shown around the edit
+
+fn toggleDock(tab: str) {
+    if S.dock == tab {
+        S.dock = ""
+        S.dockFollow = false
+    } else {
+        S.dock = tab
+        S.dockFollow = true
+    }
+    invalidate()
+}
+
+fn dockTab(tab: str, glyph: str, title: str, busy: bool) -> El {
+    let on = S.dock == tab
+    var parts: [El] = [iconSmall(glyph, if on { C_ACCENT_HI } else { C_FAINT }), label(title, F_SMALL_BOLD, if on { C_TEXT } else { C_MUTED })]
+    if busy { parts.push(dot(6, C_ACCENT_HI)) }
+    return clickable(st().row().alignTo(CENTER).gapOf(7).padXY(10, 6).round(7).fill(if on { C_PANEL_HI } else { 0 }).hover(C_PANEL), parts, fn() {
+        S.dock = tab
+    })
+}
+
+fn dockView() -> El {
+    let fileBusy = if let lf = S.live { lf.phase < 2 } else { false }
+    let tabs = box(st().row().alignTo(CENTER).gapOf(4).padTo(12, 14, 12, 6).h(66), [
+        dockTab("context", I_DATABASE, "Context", false),
+        dockTab("file", I_FILE_TEXT, "File", fileBusy and S.dock != "file"),
+        dockTab("memory", I_BOOK, "Memory", false),
+        spacer(),
+        withTip(iconButton(I_TIMES, C_FAINT, fn() {
+            S.dock = ""
+            S.dockFollow = false
+        }), "Close the dock")
+    ])
+    let body = if S.dock == "file" { fileTab() } else if S.dock == "memory" { memoryTab() } else { contextTab() }
+    return box(st().w(dockWidth()).fill(C_SIDEBAR), [tabs, box(st().h(1).fill(0xffffff0d), []), box(st().flex(1), [body])])
+}
+
+// ---- context ----
+
+struct CtxPart { name: str, color: int, chars: int = 0 }
+struct CtxItem { title: str, detail: str, part: int, chars: int }
+
+const CTX_USER = 0
+const CTX_TEXT = 1
+const CTX_THINKING = 2
+const CTX_CALLS = 3
+const CTX_RESULTS = 4
+const CTX_SHELL = 5
+const CTX_SUMMARY = 6
+
+fn ctxParts() -> [CtxPart] {
+    return [
+        CtxPart{name: "Your messages", color: 0x8a9bc4ff},
+        CtxPart{name: "Responses", color: 0xc9b58fff},
+        CtxPart{name: "Thinking", color: 0xa78fc9ff},
+        CtxPart{name: "Tool calls", color: 0x8fc9b0ff},
+        CtxPart{name: "Tool results", color: 0xc98f9fff},
+        CtxPart{name: "Shell output", color: 0x9fb7c9ff},
+        CtxPart{name: "Summaries", color: 0xc9c98fff}
+    ]
+}
+
+fn ctxTokens(chars: int) -> int { return (chars + 3) / 4 }
+
+fn contextTab() -> El {
+    var parts = ctxParts()
+    var items: [CtxItem] = []
+    // only what follows the last compaction is still in context
+    var first = 0
+    for i, m in S.messages {
+        if m.compaction { first = i }
+    }
+    for i in first..S.messages.len() {
+        let m = S.messages[i]
+        if m.role == "user" {
+            parts[CTX_USER].chars += m.text.len()
+            items.push(CtxItem{title: truncate(firstLine(m.text), 60), detail: "message", part: CTX_USER, chars: m.text.len()})
+        } else if m.role == "bash" {
+            parts[CTX_SHELL].chars += m.text.len()
+            items.push(CtxItem{title: truncate(firstLine(m.text), 60), detail: "shell", part: CTX_SHELL, chars: m.text.len()})
+        } else if m.contextChars > 0 {
+            parts[CTX_SUMMARY].chars += m.contextChars
+            items.push(CtxItem{title: "Summary of earlier conversation", detail: "summary", part: CTX_SUMMARY, chars: m.contextChars})
+        }
+        for b in m.blocks {
+            if b.kind == BlockKind.Text { parts[CTX_TEXT].chars += b.text.len() }
+            else if b.kind == BlockKind.Thinking { parts[CTX_THINKING].chars += b.text.len() }
+            else {
+                let call = if b.args.isNull() { b.text.len() } else { jsonEncode(b.args).len() }
+                parts[CTX_CALLS].chars += call
+                parts[CTX_RESULTS].chars += b.output.len()
+                let what = b.toolName + "  " + truncate(toolSummary(b), 50)
+                if call > 400 { items.push(CtxItem{title: what, detail: "call", part: CTX_CALLS, chars: call}) }
+                items.push(CtxItem{title: what, detail: "result", part: CTX_RESULTS, chars: b.output.len()})
+            }
+        }
+    }
+    var estimate = 0
+    for p in parts { estimate += ctxTokens(p.chars) }
+    // pi's own count (from the last response's usage) includes the system
+    // prompt and tool definitions, which RPC doesn't show: that's the rest
+    let usage = S.stats.at("contextUsage")
+    let known = usage.at("tokens").kind == JsonKind.Number
+    let actual = if known { usage.at("tokens").asInt() } else { estimate }
+    let window = if S.contextWindow > 0 { S.contextWindow } else { usage.at("contextWindow").asInt() }
+    let overhead = max(actual - estimate, 0)
+    // scale the estimates to pi's count when they overshoot it
+    let scale = if known and estimate > actual and estimate > 0 { (actual as float) / (estimate as float) } else { 1.0 }
+    var segments: [(str, int, int)] = [("System prompt & tools", 0x6b6b6eff, overhead)]
+    for p in parts { segments.push((p.name, p.color, ((ctxTokens(p.chars) as float) * scale) as int)) }
+    let total = max(window, max(actual, 1))
+
+    var children: [El] = []
+    // headline
+    let pct = actual * 100 / total
+    children.push(box(st().row().alignTo(CENTER).gapOf(12), [
+        box(st().flex(1).gapOf(2), [
+            label(compactNumber(actual), F_H1, C_TEXT),
+            label(if window > 0 { "of " + compactNumber(window) + " tokens · {pct}%" } else { "tokens" }, F_UI, C_MUTED)
+        ]),
+        ghostButton("Compact", fn() { runCommandText("/compact") })
+    ]))
+    // one stacked bar for the whole window
+    var bar: [El] = []
+    let barW = dockWidth() - 40
+    var used = 0
+    for seg in segments {
+        let w = seg.2 * barW / total
+        if w < 1 { continue }
+        bar.push(box(st().w(w).h(14).fill(seg.1), []))
+        used += w
+    }
+    bar.push(box(st().flex(1).h(14), []))
+    children.push(box(st().row().h(14).round(5).fill(C_PANEL_HI).clipped(), bar))
+    let tokens = S.stats.at("tokens")
+    if tokens.kind == JsonKind.Object {
+        var line = "Session total  ↑" + compactNumber(tokens.at("input").asInt()) + " in  ↓" + compactNumber(tokens.at("output").asInt()) + " out"
+        if tokens.at("cacheRead").asInt() > 0 { line = line + "  · cache " + compactNumber(tokens.at("cacheRead").asInt()) }
+        children.push(label(line, F_SMALL, C_MUTED))
+    }
+    if not known { children.push(label("pi hasn't reported usage since the last change; sizes are estimates (≈4 bytes a token).", F_SMALL, C_FAINT)) }
+    // legend
+    var legend: [El] = []
+    for seg in segments {
+        if seg.2 == 0 { continue }
+        let share = seg.2 * 1000 / max(actual, 1)
+        legend.push(box(st().row().alignTo(CENTER).gapOf(10).padXY(2, 3), [
+            box(st().w(10).h(10).round(3).fill(seg.1), []),
+            box(st().flex(1), [label(seg.0, F_UI, C_TEXT_SOFT)]),
+            label(compactNumber(seg.2), F_MONO_SMALL, C_TEXT),
+            box(st().w(52), [label("{share / 10}.{share % 10}%", F_SMALL, C_FAINT)])
+        ]))
+    }
+    children.push(box(st().gapOf(2), legend))
+    // the biggest single things in context
+    var order: [int] = []
+    for i, it in items {
+        if it.chars < 200 { continue }
+        order.push(i)
+        var at = order.len() - 1
+        while at > 0 and items[order[at - 1]].chars < it.chars {
+            order[at] = order[at - 1]
+            order[at - 1] = i
+            at -= 1
+        }
+        if order.len() > 10 { let dropped = order.pop() }
+    }
+    if order.len() > 0 {
+        children.push(box(st().padTo(0, 8, 0, 0), [label("LARGEST", F_SMALL_BOLD, C_FAINT)]))
+        let biggest = max(items[order[0]].chars, 1)
+        var rows: [El] = []
+        for k in order {
+            let it = items[k]
+            let color = parts[it.part].color
+            rows.push(box(st().gapOf(4).padXY(2, 4), [
+                box(st().row().alignTo(CENTER).gapOf(8), [
+                    box(st().flex(1), [label(it.title, F_MONO_SMALL, C_TEXT_SOFT)]),
+                    label(it.detail, F_SMALL, C_FAINT),
+                    label(compactNumber(((ctxTokens(it.chars) as float) * scale) as int), F_MONO_SMALL, C_TEXT)
+                ]),
+                box(st().h(3).w(max(it.chars * (dockWidth() - 44) / biggest, 2)).round(2).fill(color), [])
+            ]))
+        }
+        children.push(box(st().gapOf(2), rows))
+    }
+    return scroll("dock-context", st().flex(1), [box(st().gapOf(14).padTo(18, 16, 18, 20), children)], false)
+}
+
+// ---- the live file ----
+
+struct LiveLine { spans: [Span], number: int, kind: int }      // number 0: a removed line
+struct LiveRender { version: int = 0 - 1, path: str = "", lines: [LiveLine] = [], first: int = 0, total: int = 0, focus: int = 0, added: int = 0, removed: int = 0 }
+
+var liveCache = LiveRender{}
+var liveScrolledFor = ""
+
+// the file as pieces: 0 unchanged, 1 removed, 2 added
+fn liveSegments(lf: LiveFile) -> ([(str, int)], int, int) {
+    // returns (segments, focus offset, caret offset or -1)
+    var segs: [(str, int)] = []
+    if lf.tool == "write" {
+        if lf.phase >= 2 and lf.phase != 3 { return ([(lf.after, 0)], 0, 0 - 1) }
+        segs.push((lf.content, 0))
+        return (segs, lf.content.len(), if lf.phase == 0 { lf.content.len() } else { 0 - 1 })
+    }
+    if lf.tool == "edit" {
+        if lf.phase == 2 {
+            // finished: the file on disk, with the new text marked
+            var cursor = 0
+            var focus = 0 - 1
+            for e in lf.edits {
+                if e.newText == "" { continue }
+                let rel = lf.after.sub(cursor, lf.after.len()).indexOf(e.newText)
+                if rel < 0 { continue }
+                // mark whole lines
+                let begin = max(lineStartAt(lf.after, cursor + rel), cursor)
+                let end = lineEndAt(lf.after, cursor + rel + e.newText.len())
+                segs.push((lf.after.sub(cursor, begin), 0))
+                if focus < 0 { focus = begin }
+                segs.push((lf.after.sub(begin, end), 2))
+                cursor = end
+            }
+            segs.push((lf.after.sub(cursor, lf.after.len()), 0))
+            return (segs, max(focus, 0), 0 - 1)
+        }
+        // streaming or running: the old file, each located edit shown as a diff
+        var cursor = 0
+        var focus = 0
+        var caret = 0 - 1
+        var offset = 0
+        for i, e in lf.edits {
+            if e.oldText == "" { continue }
+            let rel = lf.base.sub(cursor, lf.base.len()).indexOf(e.oldText)
+            if rel < 0 { continue }
+            // a line diff: the whole lines the old text touches, then the
+            // same lines with the new text in place
+            let at = cursor + rel
+            let begin = max(lineStartAt(lf.base, at), cursor)
+            let end = lineEndAt(lf.base, at + e.oldText.len())
+            let prefix = lf.base.sub(begin, at)
+            let suffix = lf.base.sub(at + e.oldText.len(), end)
+            let plain = lf.base.sub(cursor, begin)
+            segs.push((plain, 0))
+            offset += plain.len()
+            focus = offset
+            let old = prefix + e.oldText + suffix
+            let newer = prefix + e.newText + suffix
+            let closeOld = if old.endsWith("\n") { old } else { old + "\n" }
+            segs.push((closeOld, 1))
+            offset += closeOld.len()
+            segs.push((newer, 2))
+            if lf.phase == 0 and i == lf.edits.len() - 1 { caret = offset + prefix.len() + e.newText.len() }
+            offset += newer.len()
+            cursor = end
+        }
+        segs.push((lf.base.sub(cursor, lf.base.len()), 0))
+        return (segs, focus, caret)
+    }
+    let text = if lf.tool == "read" { lf.base } else { lf.after }
+    var focus = 0
+    if lf.line > 1 {
+        var seen = 1
+        var i = 0
+        while i < text.len() and seen < lf.line {
+            if text.byte(i) == 10 { seen += 1 }
+            i += 1
+        }
+        focus = i
+    }
+    return ([(text, 0)], focus, 0 - 1)
+}
+
+// the start of the line holding offset, and the end of the line holding
+// offset - 1 (past its newline)
+fn lineStartAt(t: str, offset: int) -> int {
+    var i = min(offset, t.len())
+    while i > 0 and t.byte(i - 1) != 10 { i -= 1 }
+    return i
+}
+fn lineEndAt(t: str, offset: int) -> int {
+    var i = offset
+    if i > 0 and i <= t.len() and t.byte(i - 1) == 10 { return i }
+    while i < t.len() and t.byte(i) != 10 { i += 1 }
+    return if i < t.len() { i + 1 } else { i }
+}
+
+fn liveBg(kind: int) -> int {
+    if kind == 1 { return 0x5a3a3e80 }
+    if kind == 2 { return 0x3a5a4a80 }
+    return 0
+}
+
+fn liveRender(lf: LiveFile) -> LiveRender {
+    if liveCache.version == lf.version and liveCache.path == lf.path + lf.toolId { return liveCache }
+    let (segs, focusAt, caretAt) = liveSegments(lf)
+    var texts: [str] = []
+    var bounds: [int] = []              // end offset of each segment
+    var kinds: [int] = []
+    var at = 0
+    var added = 0
+    var removed = 0
+    for seg in segs {
+        texts.push(seg.0)
+        at += seg.0.len()
+        bounds.push(at)
+        kinds.push(seg.1)
+        if seg.1 != 0 and seg.0 != "" {
+            var n = if seg.0.endsWith("\n") { 0 } else { 1 }
+            for k in 0..seg.0.len() {
+                if seg.0.byte(k) == 10 { n += 1 }
+            }
+            if seg.1 == 1 { removed += n } else { added += n }
+        }
+    }
+    let full = texts.join()
+    // line starts, and which lines are entirely removed text
+    var starts: [int] = [0]
+    for k in 0..full.len() {
+        if full.byte(k) == 10 { starts.push(k + 1) }
+    }
+    var focusLine = 0
+    while focusLine + 1 < starts.len() and starts[focusLine + 1] <= focusAt { focusLine += 1 }
+    var first = max(focusLine - 12, 0)
+    if lf.tool == "write" { first = max(starts.len() - LIVE_WINDOW, 0) }
+    let last = min(first + LIVE_WINDOW, starts.len())
+    let from = starts[first]
+    let to = if last < starts.len() { starts[last] } else { full.len() }
+    if hlKeywords.len() == 0 { hlInit() }
+    let spans = highlightUncached(full.sub(from, to), languageOfPath(lf.path), F_MONO_SMALL)
+    // cut the spans at newlines and segment edges, colouring by segment
+    var lines: [LiveLine] = []
+    var cur: [Span] = []
+    var curKinds = 0                    // bit per kind present on the line
+    var seg = 0
+    while seg < bounds.len() and bounds[seg] <= from { seg += 1 }
+    var pos = from
+    // numbers: lines before the window, minus whole removed lines before it
+    var number = first
+    for i, b in bounds {
+        if b > from { break }
+        if kinds[i] == 1 {
+            let begin = if i == 0 { 0 } else { bounds[i - 1] }
+            for k in begin..b {
+                if full.byte(k) == 10 { number -= 1 }
+            }
+        }
+    }
+    for sp in spans {
+        var t = sp.text
+        while t != "" {
+            let segKind = if seg < kinds.len() { kinds[seg] } else { 0 }
+            let segEnd = if seg < bounds.len() { bounds[seg] } else { to }
+            let nl = t.indexOf("\n")
+            var take = if nl < 0 { t.len() } else { nl }
+            take = min(take, segEnd - pos)
+            if take > 0 {
+                var color = sp.color
+                if segKind == 1 { color = C_DIFF_DEL_TEXT }
+                cur.push(Span{text: t.sub(0, take), font: sp.font, color: color, bg: 0})
+                curKinds = curKinds | (1 << segKind)
+                pos += take
+                t = t.sub(take, t.len())
+            }
+            if pos == caretAt { cur.push(Span{text: "▍", font: F_MONO_SMALL, color: C_ACCENT_HI}) }
+            if pos >= segEnd and seg < bounds.len() {
+                seg += 1
+                continue
+            }
+            if t != "" and t.byte(0) == 10 {
+                // a newline inside removed text ends a removed line
+                let kind = if curKinds == 2 or (curKinds == 0 and segKind == 1) { 1 } else if curKinds == 4 or (curKinds == 0 and segKind == 2) { 2 } else { 0 }
+                if kind != 1 { number += 1 }
+                lines.push(LiveLine{spans: cur, number: if kind == 1 { 0 } else { number }, kind: kind})
+                cur = []
+                curKinds = 0
+                pos += 1
+                t = t.sub(1, t.len())
+            }
+        }
+    }
+    if cur.len() > 0 or pos == full.len() {
+        let kind = if curKinds == 2 { 1 } else if curKinds == 4 { 2 } else { 0 }
+        if kind != 1 { number += 1 }
+        lines.push(LiveLine{spans: cur, number: if kind == 1 { 0 } else { number }, kind: kind})
+    }
+    liveCache = LiveRender{version: lf.version, path: lf.path + lf.toolId, lines: lines, first: first, total: starts.len(), focus: focusLine, added: added, removed: removed}
+    return liveCache
+}
+
+fn liveStatus(lf: LiveFile) -> (str, int) {
+    if lf.phase == 3 { return ("failed", C_BAD) }
+    if lf.tool == "write" {
+        if lf.phase == 0 { return ("writing " + spinnerGlyph(), C_ACCENT_HI) }
+        if lf.phase == 1 { return ("saving " + spinnerGlyph(), C_ACCENT_HI) }
+        return (if lf.existed { "rewritten" } else { "created" }, C_GOOD)
+    }
+    if lf.tool == "edit" {
+        if lf.phase == 0 { return ("editing " + spinnerGlyph(), C_ACCENT_HI) }
+        if lf.phase == 1 { return ("applying " + spinnerGlyph(), C_ACCENT_HI) }
+        return ("edited", C_GOOD)
+    }
+    if lf.tool == "read" { return ("read", C_MUTED) }
+    return ("", C_MUTED)
+}
+
+fn fileTab() -> El {
+    var children: [El] = []
+    if let lf = S.live {
+        let (status, color) = liveStatus(lf)
+        let path = lf.path
+        var head: [El] = [
+            iconSmall(toolIcon(if lf.tool == "view" { "read" } else { lf.tool }), color),
+            box(st().flex(1).gapOf(2), [
+                label(baseName(path), F_UI_BOLD, C_TEXT),
+                label(truncate(shortPath(path), 70), F_SMALL, C_FAINT)
+            ])
+        ]
+        let r = if lf.tooBig { LiveRender{} } else { liveRender(lf) }
+        if r.added > 0 { head.push(label("+{r.added}", F_MONO_SMALL, 0x8fc9a0ff)) }
+        if r.removed > 0 { head.push(label("−{r.removed}", F_MONO_SMALL, 0xc98f8fff)) }
+        if status != "" { head.push(label(status, F_SMALL_BOLD, color)) }
+        head.push(iconButton(I_COPY, C_FAINT, fn() { copyAndTell(path) }))
+        children.push(box(st().row().alignTo(CENTER).gapOf(10).padTo(16, 10, 10, 10), head))
+        children.push(touchedChips(path))
+        if lf.tooBig {
+            children.push(box(st().pad(18), [label("This file is too large to show.", F_UI, C_MUTED)]))
+        } else if not lf.existed and lf.tool != "write" {
+            children.push(box(st().padXY(18, 6), [label("Not found on disk; the edit may have failed.", F_SMALL, C_FAINT)]))
+        } else if lf.tool == "edit" and lf.phase < 2 and lf.edits.len() > 0 and r.removed == 0 and r.added == 0 {
+            children.push(box(st().padXY(18, 6), [label("Finding the text to replace…", F_SMALL, C_FAINT)]))
+        }
+        if not lf.tooBig {
+            var rows: [El] = []
+            if r.first > 0 { rows.push(box(st().padXY(12, 4), [label("… {r.first} lines above", F_SMALL, C_FAINT)])) }
+            for ln in r.lines {
+                let bg = liveBg(ln.kind)
+                let mark = if ln.kind == 1 { "−" } else if ln.kind == 2 { "+" } else { "" }
+                var spans = ln.spans
+                if spans.len() == 0 { spans = [Span{text: " ", font: F_MONO_SMALL, color: C_TEXT}] }
+                rows.push(box(st().row().fill(bg), [
+                    box(st().w(46).padTo(0, 0, 8, 0).alignTo(END), [label(if ln.number > 0 { "{ln.number}" } else { mark }, F_MONO_SMALL, C_FAINT)]),
+                    rich(st().flex(1).padTo(0, 0, 10, 0), spans)
+                ]))
+            }
+            let shownEnd = r.first + r.lines.len()
+            if shownEnd < r.total { rows.push(box(st().padXY(12, 4), [label("… {r.total - shownEnd} lines below", F_SMALL, C_FAINT)])) }
+            // jump to the edit once per tool call; writes follow their end
+            let follow = lf.tool == "write" and lf.phase < 2
+            if not follow and liveScrolledFor != lf.toolId + lf.path {
+                liveScrolledFor = lf.toolId + lf.path
+                scrollTo("dock-file", 0)
+            }
+            children.push(scroll("dock-file", st().flex(1).fill(C_CODE_BG), [box(st().padXY(0, 8), rows)], follow))
+        }
+    } else {
+        children.push(box(st().pad(22).gapOf(8), [
+            label("No file yet", F_UI_BOLD, C_TEXT),
+            label("When pi reads, writes or edits a file it shows up here, and edits stream in as the model types them.", F_SMALL, C_MUTED)
+        ]))
+        children.push(touchedChips(""))
+    }
+    return box(st().flex(1), children)
+}
+
+fn touchedChips(current: str) -> El {
+    var chips: [El] = []
+    for p in S.touched {
+        if p == current { continue }
+        let path = p
+        chips.push(clickable(st().padXY(8, 3).round(6).fill(C_PANEL).hover(C_PANEL_HI), [label(baseName(path), F_SMALL, C_MUTED)], fn() { liveView(path) }))
+        if chips.len() >= 6 { break }
+    }
+    if chips.len() == 0 { return box(st(), []) }
+    return box(st().row().gapOf(6).padTo(16, 0, 16, 10), chips)
+}

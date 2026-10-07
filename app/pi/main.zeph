@@ -1,0 +1,94 @@
+// pi desktop: a native window for the pi coding agent, written in Zephyr.
+//
+//   pi-desk [folder] [-- pi arguments...]
+//
+// Starts `pi --mode rpc` in the folder (through the `pi` on PATH, so wrapper
+// scripts that start local model services keep working) and drives it.
+// PI_DESK_PI overrides the pi command.
+import "dock.zeph"
+
+var lastTitle = ""
+var lastSpin = 0
+var lastReap = 0
+
+fn tick() -> int {
+    if pumpPi() { invalidate() }
+    pollChildren()
+    appsTick()
+    thumbsTick()
+    saveLayoutIfDone()
+    let now = nowMs()
+    if now - lastReap > 1000 {
+        lastReap = now
+        procReapAdopted()
+    }
+    if S.toasts.len() > 0 {
+        var kept: [Toast] = []
+        for t in S.toasts {
+            if t.until > now { kept.push(t) }
+        }
+        if kept.len() != S.toasts.len() {
+            S.toasts = kept
+            invalidate()
+        }
+    }
+    if (S.running or S.bashRunning or S.compacting) and now - lastSpin > 90 {
+        lastSpin = now
+        S.spinner += 1
+        invalidate()
+    }
+    var title = if S.title != "" { S.title } else { sessionTitleNow() + " — pi" }
+    if title != lastTitle {
+        lastTitle = title
+        SDL_SetWindowTitle(zuiWindow, cstr(title))
+    }
+    if S.running or S.bashRunning or S.compacting { return 33 }
+    if S.toasts.len() > 0 or apps.len() > 0 or S.editorProc.has() or S.terminalProc.has() { return 100 }
+    return 250
+}
+
+fn currentDirectory() -> str {
+    let buffer = cstrIn(4, " ".repeat(4096))
+    let n = syscall(79, buffer, 4096)
+    if n <= 0 { return "" }
+    return strFromC(buffer)
+}
+
+fn main() {
+    let argv = args()
+    var piArgs: [str] = []
+    var i = 1
+    var passthrough = false
+    while i < argv.len() {
+        let a = argv[i]
+        if passthrough { piArgs.push(a) }
+        else if a == "--" { passthrough = true }
+        else if a == "-h" or a == "--help" {
+            print("usage: pi-desk [folder] [-- pi arguments...]")
+            return
+        } else if chdir(cstr(a)) != 0 {
+            print("pi-desk: cannot open folder {a}")
+            return
+        }
+        i += 1
+    }
+    S.cwd = currentDirectory()
+    S.home = envVar("HOME")
+    let custom = envVar("PI_DESK_PI")
+    S.piCommand = if custom != "" { custom.split(" ") } else { ["pi"] }
+    // programs pi starts in the background stay ours (in-app windows find
+    // them by ancestry) even after the shell that started them exits
+    let adopted = procBecomeSubreaper()
+    refreshSessions()
+    onGlobalKey(globalKey)
+    onDrop(dropFile)
+    onPaste(pasteImage)
+    startPi(piArgs)
+    zuiRun(App{title: "pi", background: C_BG, render: appView, tick: tick, setup: fn() {
+        loadZoom()
+        loadLayout()
+        openFonts()
+    }}, 1180, 800)
+    appsQuit()
+    stopPi()
+}

@@ -1,0 +1,1160 @@
+// The session model: pi's RPC process, the conversation as display messages,
+// and how every command response and session event updates them.
+import "markdown.zeph"
+import "files.zeph"
+import "../../lib/proc.zeph"
+import "../../lib/json.zeph"
+import "std/io.zeph"
+
+enum BlockKind { Text, Thinking, Tool }
+
+struct Block {
+    kind: BlockKind
+    text: str = ""             // text, thinking, or a tool call's streaming argument JSON
+    toolId: str = ""
+    toolName: str = ""
+    args: Json = Json{kind: JsonKind.Null}
+    output: str = ""           // tool result (partial while running)
+    status: int = 0            // tools: 0 arguments streaming, 1 running, 2 done, 3 failed
+    expanded: bool = false
+    startedAt: int = 0         // tools: execution start and end, ms (0: not seen live)
+    endedAt: int = 0
+}
+
+struct Msg {
+    id: int
+    role: str                  // user, assistant, bash, info, error
+    text: str = ""
+    blocks: [Block] = []
+    streaming: bool = false
+    error: str = ""
+    startedAt: int = 0         // bash: run start and end, ms
+    endedAt: int = 0
+    compaction: bool = false   // context before this message was summarized away
+    contextChars: int = 0      // summary text the model sees (compaction, branch summaries)
+    images: [Attachment] = []  // user: pictures sent with the prompt
+}
+
+struct SessionInfo { path: str, title: str, stamp: str, epoch: int }
+
+struct Toast { text: str, kind: str, until: int }
+
+struct Attachment { name: str, mime: str, data: str }      // data: base64
+
+struct State {
+    proc: Proc? = none
+    piCommand: [str] = []
+    launchProvider: str = ""
+    connected: bool = false
+    exitNote: str = ""
+    messages: [Msg] = []
+    nextMsgId: int = 1
+    running: bool = false
+    compacting: bool = false
+    retryNote: str = ""
+    provider: str = ""
+    modelId: str = ""
+    modelName: str = ""
+    thinking: str = ""
+    models: [Json] = []
+    levels: [str] = []
+    sessionFile: str = ""
+    sessionName: str = ""
+    tokens: int = 0
+    cost: float = 0.0
+    contextPercent: float = 0.0 - 1.0
+    contextWindow: int = 0
+    steering: [str] = []
+    followUp: [str] = []
+    composer: str = ""
+    history: [str] = []
+    historyIndex: int = 0 - 1
+    sessions: [SessionInfo] = []
+    sidebar: bool = true
+    popup: str = ""
+    dialog: Json = Json{kind: JsonKind.Null}
+    dialogText: str = ""
+    toasts: [Toast] = []
+    statuses: [str: str] = [:]
+    widgets: [str: str] = [:]
+    nextRequest: int = 1
+    cwd: str = ""
+    home: str = ""
+    title: str = ""
+    spinner: int = 0
+    // CLI parity
+    commands: [Json] = []            // extension, prompt-template and skill commands
+    images: [Attachment] = []
+    showThinking: bool = true        // Ctrl+T
+    expandTools: bool = false        // Ctrl+O
+    autoCompaction: bool = true
+    autoRetry: bool = true
+    steeringMode: str = ""
+    followUpMode: str = ""
+    bashRunning: bool = false
+    bashMsgId: int = 0
+    stats: Json = Json{kind: JsonKind.Null}
+    forkMessages: [Json] = []
+    tree: [Json] = []
+    leafId: str = ""
+    // overlays: "", "palette", "model", "thinking", "resume", "fork", "tree", "session", "settings", "hotkeys", "rename", "terminal", "delete"
+    panel: str = ""
+    panelQuery: str = ""
+    panelIndex: int = 0
+    panelArg: str = ""
+    // composer suggestions (/ commands, @ files, paths)
+    suggestIndex: int = 0
+    suggestDismissed: str = ""
+    sessionFilter: str = ""
+    editorProc: Proc? = none
+    editorFile: str = ""
+    terminalProc: Proc? = none
+    lastPromptAt: int = 0
+    // the right-hand dock: "", "context" or "file"
+    dock: str = ""
+    dockFollow: bool = true          // open the file tab when pi starts writing
+    live: LiveFile? = none
+    livePending: Block? = none       // a write/edit whose streamed arguments changed
+    touched: [str] = []              // files pi touched, newest first
+    // generation speed of the current (or last) response
+    tpsStart: int = 0                // first streamed delta, ms
+    tpsChars: int = 0
+    tpsTokens: int = 0               // provider-reported output tokens, 0 when not streamed
+    tps: float = 0.0 - 1.0
+    tpsEstimated: bool = false
+}
+
+var S = State{}
+
+fn nowMs() -> int {
+    let ts = cstrIn(5, "")
+    syscall(228, 0, ts)                 // clock_gettime(CLOCK_REALTIME)
+    return load64(ts) * 1000 + load64(ts + 8) / 1000000
+}
+
+fn toast(text: str, kind: str) {
+    S.toasts.push(Toast{text: text, kind: kind, until: nowMs() + 5000})
+    invalidate()
+}
+
+// ---- talking to pi ----
+
+fn send(fields: Json) {
+    if not S.proc.has() { return }
+    let id = "r{S.nextRequest}"
+    S.nextRequest += 1
+    let line = jsonEncode(fields.set("id", jstr(id))) + "\n"
+    if not procWrite(S.proc.get(), line) { toast("pi is not accepting input", "error") }
+}
+
+fn command(kind: str) -> Json { return jobj(["type"], [jstr(kind)]) }
+
+fn startPi(extra: [str]) {
+    var argv: [str] = []
+    for a in S.piCommand { argv.push(a) }
+    argv.push("--mode")
+    argv.push("rpc")
+    for a in extra { argv.push(a) }
+    S.launchProvider = ""
+    for i, a in argv {
+        if a == "--provider" and i + 1 < argv.len() { S.launchProvider = argv[i + 1] }
+    }
+    S.proc = procSpawn(argv)
+    if not S.proc.has() {
+        S.exitNote = "Could not start '{S.piCommand[0]}'. Is pi on your PATH?"
+        return
+    }
+    S.connected = true
+    S.exitNote = ""
+    send(command("get_state"))
+    send(command("get_available_models"))
+    send(command("get_available_thinking_levels"))
+    send(command("get_messages"))
+    send(command("get_session_stats"))
+    send(command("get_commands"))
+}
+
+fn stopPi() {
+    if let p = S.proc {
+        procCloseInput(p)
+        var waited = 0
+        while not procPoll(p) and waited < 300 {
+            let ts = cstrIn(5, "")
+            store64(ts, 0)
+            store64(ts + 8, 10000000)
+            syscall(35, ts, 0)                  // nanosleep 10 ms
+            waited += 1
+        }
+        procKill(p)
+        let reaped = procPoll(p)
+    }
+    S.proc = none
+    S.connected = false
+}
+
+// restart pi on a session (through the wrapper, so local model services follow)
+fn restartPi(extra: [str]) {
+    stopPi()
+    S.running = false
+    S.messages = []
+    startPi(extra)
+    invalidate()
+}
+
+// poll pi; returns true when anything changed
+fn pumpPi() -> bool {
+    if not S.proc.has() { return false }
+    let p = S.proc.get()
+    let lines = procLines(p)
+    for line in lines {
+        if line == "" { continue }
+        if let record = parseJsonText(line) { handleRecord(record) }
+    }
+    // streamed tool arguments are re-read once per poll, not once per delta
+    if let b = S.livePending {
+        S.livePending = none
+        if b.status == 0 { liveFromStream(b) }
+    }
+    if not p.stdoutOpen and procPoll(p) {
+        S.connected = false
+        S.running = false
+        var note = "pi exited (code {p.exitCode})."
+        let tail = p.errTail.trim()
+        if tail != "" {
+            let lastLines = tail.split("\n")
+            var start = max(lastLines.len() - 6, 0)
+            var kept: [str] = []
+            for k in start..lastLines.len() { kept.push(lastLines[k]) }
+            note = note + "\n" + kept.join("\n")
+        }
+        S.exitNote = note
+        S.proc = none
+        return true
+    }
+    return lines.len() > 0
+}
+
+// ---- message helpers ----
+
+fn contentText(content: Json) -> str {
+    if content.kind == JsonKind.Text { return content.text }
+    var parts: [str] = []
+    for c in content.list() {
+        let t = c.at("type").asStr()
+        if t == "text" { parts.push(c.at("text").asStr()) }
+        else if t == "image" { parts.push("[image]") }
+    }
+    return parts.join("\n")
+}
+
+// the pictures in a message's content
+fn contentImages(content: Json) -> [Attachment] {
+    var out: [Attachment] = []
+    if content.kind == JsonKind.Text { return out }
+    for c in content.list() {
+        if c.at("type").asStr() == "image" {
+            out.push(Attachment{name: "image {out.len() + 1}", mime: c.at("mimeType").asStr(), data: c.at("data").asStr()})
+        }
+    }
+    return out
+}
+
+// a user message: its text (without "[image]" stand-ins) and its pictures
+fn addUserMsg(content: Json) -> Msg {
+    let images = contentImages(content)
+    var text = contentText(content)
+    if images.len() > 0 {
+        var lines: [str] = []
+        for line in text.split("\n") {
+            if line != "[image]" { lines.push(line) }
+        }
+        text = lines.join("\n").trim()
+    }
+    let m = addMsg("user", text)
+    m.images = images
+    return m
+}
+
+fn addMsg(role: str, text: str) -> Msg {
+    let m = Msg{id: S.nextMsgId, role: role, text: text}
+    S.nextMsgId += 1
+    S.messages.push(m)
+    return m
+}
+
+fn findTool(id: str) -> Block? {
+    var i = S.messages.len() - 1
+    while i >= 0 {
+        for b in S.messages[i].blocks {
+            if b.kind == BlockKind.Tool and b.toolId == id { return b }
+        }
+        i -= 1
+    }
+    return none
+}
+
+fn blocksFromContent(content: Json, previous: [Block]) -> [Block] {
+    var blocks: [Block] = []
+    for c in content.list() {
+        let t = c.at("type").asStr()
+        var b = Block{kind: BlockKind.Text}
+        if t == "text" { b.text = c.at("text").asStr() }
+        else if t == "thinking" {
+            b.kind = BlockKind.Thinking
+            b.text = if c.at("redacted").asBool() { "(redacted thinking)" } else { c.at("thinking").asStr() }
+        } else if t == "toolCall" {
+            b.kind = BlockKind.Tool
+            b.toolId = c.at("id").asStr()
+            b.toolName = c.at("name").asStr()
+            b.args = c.at("arguments")
+            b.status = 1
+        } else { continue }
+        // keep what the stream already knew: expansion, tool progress
+        if b.kind == BlockKind.Tool {
+            for old in previous {
+                if old.kind == BlockKind.Tool and old.toolId == b.toolId {
+                    b.expanded = old.expanded
+                    b.output = old.output
+                    b.startedAt = old.startedAt
+                    b.endedAt = old.endedAt
+                    b.status = max(old.status, 1)
+                }
+            }
+        } else if blocks.len() < previous.len() and previous[blocks.len()].kind == b.kind {
+            b.expanded = previous[blocks.len()].expanded
+        }
+        blocks.push(b)
+    }
+    return blocks
+}
+
+fn assistantError(m: Json) -> str {
+    let reason = m.at("stopReason").asStr()
+    if reason == "error" {
+        let e = m.at("errorMessage").asStr()
+        return if e == "" { "The model returned an error." } else { e }
+    }
+    if reason == "aborted" { return "Stopped." }
+    if reason == "length" { return "Reached the output limit." }
+    return ""
+}
+
+fn applyToolResult(m: Json) {
+    if let b = findTool(m.at("toolCallId").asStr()) {
+        b.output = contentText(m.at("content"))
+        b.status = if m.at("isError").asBool() { 3 } else { 2 }
+    }
+}
+
+fn loadHistory(list: [Json]) {
+    S.messages = []
+    for m in list {
+        let role = m.at("role").asStr()
+        if role == "user" {
+            addUserMsg(m.at("content"))
+        } else if role == "assistant" {
+            let msg = addMsg("assistant", "")
+            var fresh: [Block] = []
+            msg.blocks = blocksFromContent(m.at("content"), fresh)
+            msg.error = assistantError(m)
+        } else if role == "toolResult" {
+            applyToolResult(m)
+        } else if role == "bashExecution" {
+            addMsg("bash", "$ " + m.at("command").asStr() + "\n" + m.at("output").asStr())
+        } else if role == "compactionSummary" or role == "branchSummary" {
+            let m2 = addMsg("info", "Earlier conversation summarized.")
+            m2.compaction = role == "compactionSummary"
+            m2.contextChars = m.at("summary").asStr().len()
+        }
+    }
+    // every tool with no result in the history is finished
+    for msg in S.messages {
+        for b in msg.blocks {
+            if b.kind == BlockKind.Tool and b.status < 2 { b.status = 2 }
+        }
+    }
+}
+
+fn lastAssistant() -> Msg? {
+    if S.messages.len() == 0 { return none }
+    let m = S.messages[S.messages.len() - 1]
+    if m.role == "assistant" { return m }
+    return none
+}
+
+fn blockAt(m: Msg, index: int, kind: BlockKind) -> Block {
+    while m.blocks.len() <= index { m.blocks.push(Block{kind: kind}) }
+    let b = m.blocks[index]
+    if b.kind != kind and b.text == "" { b.kind = kind }
+    return b
+}
+
+fn stringList(v: Json) -> [str] {
+    var out: [str] = []
+    for item in v.list() {
+        if item.kind == JsonKind.Text { out.push(item.text) }
+        else { out.push(contentText(item.at("content")) + item.at("text").asStr() + item.at("message").asStr()) }
+    }
+    return out
+}
+
+// ---- records from pi ----
+
+fn handleRecord(v: Json) {
+    let kind = v.at("type").asStr()
+    if kind == "response" {
+        handleResponse(v)
+        return
+    }
+    if kind == "message_start" {
+        let m = v.at("message")
+        let role = m.at("role").asStr()
+        if role == "user" {
+            addUserMsg(m.at("content"))
+        } else if role == "assistant" {
+            let msg = addMsg("assistant", "")
+            msg.streaming = true
+            S.tpsStart = 0
+            S.tpsChars = 0
+            S.tpsTokens = 0
+        }
+        return
+    }
+    if kind == "message_update" {
+        if let m = lastAssistant() {
+            let e = v.at("assistantMessageEvent")
+            let t = e.at("type").asStr()
+            let index = e.at("contentIndex").asInt()
+            if t.endsWith("_delta") { tpsSample(e.at("delta").asStr().len(), v.at("usage").at("output").asInt()) }
+            if t == "text_start" { blockAt(m, index, BlockKind.Text) }
+            else if t == "text_delta" { let b = blockAt(m, index, BlockKind.Text)
+                b.text = b.text + e.at("delta").asStr() }
+            else if t == "text_end" { blockAt(m, index, BlockKind.Text).text = e.at("content").asStr() }
+            else if t == "thinking_start" { blockAt(m, index, BlockKind.Thinking) }
+            else if t == "thinking_delta" { let b = blockAt(m, index, BlockKind.Thinking)
+                b.text = b.text + e.at("delta").asStr() }
+            else if t == "thinking_end" { blockAt(m, index, BlockKind.Thinking).text = e.at("content").asStr() }
+            else if t == "toolcall_start" {
+                let b = blockAt(m, index, BlockKind.Tool)
+                b.toolId = e.at("id").asStr()
+                b.toolName = e.at("toolName").asStr()
+            } else if t == "toolcall_delta" { let b = blockAt(m, index, BlockKind.Tool)
+                b.text = b.text + e.at("delta").asStr()
+                if b.toolName == "write" or b.toolName == "edit" { S.livePending = b } }
+            else if t == "toolcall_end" {
+                let b = blockAt(m, index, BlockKind.Tool)
+                let call = e.at("toolCall")
+                b.toolId = call.at("id").asStr()
+                b.toolName = call.at("name").asStr()
+                b.args = call.at("arguments")
+                b.status = 1
+                liveFromArgs(b)
+            }
+        }
+        return
+    }
+    if kind == "message_end" {
+        let m = v.at("message")
+        let role = m.at("role").asStr()
+        if role == "assistant" {
+            tpsSample(0, m.at("usage").at("output").asInt())
+            if let msg = lastAssistant() {
+                msg.blocks = blocksFromContent(m.at("content"), msg.blocks)
+                msg.streaming = false
+                msg.error = assistantError(m)
+            }
+        } else if role == "toolResult" {
+            applyToolResult(m)
+        }
+        return
+    }
+    if kind == "tool_execution_start" {
+        if let b = findTool(v.at("toolCallId").asStr()) {
+            b.status = 1
+            if b.startedAt == 0 { b.startedAt = nowMs() }
+            if b.args.isNull() { b.args = v.at("args") }
+            liveFromArgs(b)
+        }
+        return
+    }
+    if kind == "tool_execution_update" {
+        if let b = findTool(v.at("toolCallId").asStr()) { b.output = contentText(v.at("partialResult").at("content")) }
+        return
+    }
+    if kind == "tool_execution_end" {
+        if let b = findTool(v.at("toolCallId").asStr()) {
+            b.output = contentText(v.at("result").at("content"))
+            b.status = if v.at("isError").asBool() { 3 } else { 2 }
+            if b.startedAt > 0 and b.endedAt == 0 { b.endedAt = nowMs() }
+            liveFinish(b)
+        }
+        return
+    }
+    if kind == "agent_start" {
+        S.running = true
+        return
+    }
+    if kind == "agent_settled" {
+        S.running = false
+        S.retryNote = ""
+        for msg in S.messages { msg.streaming = false }
+        send(command("get_session_stats"))
+        send(command("get_state"))
+        send(command("get_fork_messages"))
+        refreshSessions()
+        return
+    }
+    if kind == "queue_update" {
+        S.steering = stringList(v.at("steering"))
+        S.followUp = stringList(v.at("followUp"))
+        return
+    }
+    if kind == "compaction_start" {
+        S.compacting = true
+        return
+    }
+    if kind == "compaction_end" {
+        S.compacting = false
+        if v.at("aborted").asBool() { toast("Compaction aborted", "warning") }
+        else if v.has("errorMessage") { toast("Compaction failed: " + v.at("errorMessage").asStr(), "error") }
+        else {
+            let r = v.at("result")
+            let marker = addMsg("info", "Context compacted: {r.at("tokensBefore").asInt() / 1000}k → {r.at("estimatedTokensAfter").asInt() / 1000}k tokens")
+            marker.compaction = true
+            marker.contextChars = r.at("summary").asStr().len()
+        }
+        send(command("get_session_stats"))
+        return
+    }
+    if kind == "auto_retry_start" {
+        // the failed attempt left an empty assistant message: the retry replaces it
+        if let m = lastAssistant() {
+            var empty = true
+            for b in m.blocks {
+                if b.kind == BlockKind.Tool or b.text.trim() != "" { empty = false }
+            }
+            if empty { let dropped = S.messages.pop() }
+        }
+        S.retryNote = "Retrying ({v.at("attempt").asInt()}/{v.at("maxAttempts").asInt()}): " + v.at("errorMessage").asStr()
+        return
+    }
+    if kind == "auto_retry_end" {
+        S.retryNote = ""
+        if not v.at("success").asBool() { addMsg("error", v.at("finalError").asStr()) }
+        return
+    }
+    if kind == "session_info_changed" {
+        S.sessionName = v.at("name").asStr()
+        return
+    }
+    if kind == "thinking_level_changed" {
+        S.thinking = v.at("level").asStr()
+        return
+    }
+    if kind == "extension_ui_request" {
+        handleExtensionRequest(v)
+        return
+    }
+    if kind == "bash_execution_update" {
+        if let m = findMsg(S.bashMsgId) {
+            m.text = m.text + v.at("delta").asStr()
+        }
+        return
+    }
+    if kind == "extension_error" {
+        toast("Extension error: " + v.at("error").asStr(), "error")
+        return
+    }
+}
+
+fn findMsg(id: int) -> Msg? {
+    var i = S.messages.len() - 1
+    while i >= 0 {
+        if S.messages[i].id == id { return S.messages[i] }
+        i -= 1
+    }
+    return none
+}
+
+fn handleExtensionRequest(v: Json) {
+    let method = v.at("method").asStr()
+    if method == "select" or method == "confirm" or method == "input" or method == "editor" {
+        S.dialog = v
+        S.dialogText = v.at("prefill").asStr()
+        return
+    }
+    if method == "notify" {
+        let kind = v.at("notifyType").asStr()
+        toast(v.at("message").asStr(), if kind == "" { "info" } else { kind })
+        return
+    }
+    if method == "setStatus" {
+        let key = v.at("statusKey").asStr()
+        if v.has("statusText") and not v.at("statusText").isNull() { S.statuses[key] = v.at("statusText").asStr() }
+        else if S.statuses.has(key) { S.statuses.remove(key) }
+        return
+    }
+    if method == "setWidget" {
+        let key = v.at("widgetKey").asStr()
+        if v.has("widgetLines") and not v.at("widgetLines").isNull() { S.widgets[key] = stringList(v.at("widgetLines")).join("\n") }
+        else if S.widgets.has(key) { S.widgets.remove(key) }
+        return
+    }
+    if method == "setTitle" {
+        S.title = v.at("title").asStr()
+        return
+    }
+    if method == "set_editor_text" {
+        S.composer = v.at("text").asStr()
+        return
+    }
+}
+
+fn answerDialog(fields: Json) {
+    let id = S.dialog.at("id").asStr()
+    S.dialog = jnull()
+    S.dialogText = ""
+    if not S.proc.has() { return }
+    let line = jsonEncode(fields.set("type", jstr("extension_ui_response")).set("id", jstr(id))) + "\n"
+    let ok = procWrite(S.proc.get(), line)
+    invalidate()
+}
+
+fn handleResponse(v: Json) {
+    let cmd = v.at("command").asStr()
+    let data = v.at("data")
+    if not v.at("success").asBool() {
+        if cmd == "bash" {
+            S.bashRunning = false
+            if let m = findMsg(S.bashMsgId) { m.endedAt = nowMs() }
+        }
+        toast(v.at("error").asStr(), "error")
+        return
+    }
+    if cmd == "get_state" {
+        let model = data.at("model")
+        S.provider = model.at("provider").asStr()
+        S.modelId = model.at("id").asStr()
+        S.modelName = model.at("name").asStr()
+        S.contextWindow = model.at("contextWindow").asInt()
+        S.thinking = data.at("thinkingLevel").asStr()
+        S.running = data.at("isStreaming").asBool()
+        S.compacting = data.at("isCompacting").asBool()
+        S.sessionFile = data.at("sessionFile").asStr()
+        S.sessionName = data.at("sessionName").asStr()
+        if data.has("autoCompactionEnabled") { S.autoCompaction = data.at("autoCompactionEnabled").asBool() }
+        S.steeringMode = data.at("steeringMode").asStr()
+        S.followUpMode = data.at("followUpMode").asStr()
+        return
+    }
+    if cmd == "get_commands" {
+        S.commands = data.at("commands").list()
+        return
+    }
+    if cmd == "bash" {
+        S.bashRunning = false
+        if let m = findMsg(S.bashMsgId) {
+            m.endedAt = nowMs()
+            var text = m.text
+            if data.at("cancelled").asBool() { text = text + "\n(cancelled)" }
+            else if data.at("exitCode").asInt() != 0 { text = text + "\n(exit {data.at("exitCode").asInt()})" }
+            if data.at("truncated").asBool() { text = text + "\n(output truncated; full log: " + data.at("fullOutputPath").asStr() + ")" }
+            m.text = text
+        }
+        return
+    }
+    if cmd == "cycle_model" {
+        if not data.isNull() {
+            let model = data.at("model")
+            S.provider = model.at("provider").asStr()
+            S.modelId = model.at("id").asStr()
+            S.modelName = model.at("name").asStr()
+            S.thinking = data.at("thinkingLevel").asStr()
+            toast("Model: " + S.modelName, "info")
+            send(command("get_available_thinking_levels"))
+        } else {
+            toast("Only one model is available", "info")
+        }
+        return
+    }
+    if cmd == "cycle_thinking_level" {
+        if data.isNull() { toast("This model has no thinking levels", "info") }
+        else { S.thinking = data.at("level").asStr() }
+        return
+    }
+    if cmd == "clear_queue" {
+        // the CLI puts queued messages back in the editor
+        var restored = stringList(data.at("steering"))
+        for f in stringList(data.at("followUp")) { restored.push(f) }
+        S.steering = []
+        S.followUp = []
+        if restored.len() > 0 {
+            if S.composer.trim() != "" { restored.push(S.composer) }
+            S.composer = restored.join("\n\n")
+            requestFocus("composer")
+        }
+        if S.panelArg == "abort-after-clear" {
+            S.panelArg = ""
+            send(command("abort"))
+        }
+        return
+    }
+    if cmd == "get_fork_messages" {
+        S.forkMessages = data.at("messages").list()
+        return
+    }
+    if cmd == "fork" {
+        if data.at("cancelled").asBool() { return }
+        S.messages = []
+        S.composer = data.at("text").asStr()
+        requestFocus("composer")
+        toast("Forked into a new session — edit the prompt and send", "info")
+        send(command("get_state"))
+        send(command("get_messages"))
+        send(command("get_session_stats"))
+        refreshSessions()
+        return
+    }
+    if cmd == "clone" {
+        if data.at("cancelled").asBool() { return }
+        toast("Cloned into a new session", "info")
+        send(command("get_state"))
+        send(command("get_messages"))
+        refreshSessions()
+        return
+    }
+    if cmd == "get_tree" {
+        S.tree = data.at("tree").list()
+        S.leafId = data.at("leafId").asStr()
+        return
+    }
+    if cmd == "export_html" {
+        let path = data.at("path").asStr()
+        copyText(path)
+        toast("Exported to " + path + " (path copied)", "info")
+        return
+    }
+    if cmd == "set_session_name" {
+        send(command("get_state"))
+        refreshSessions()
+        return
+    }
+    if cmd == "set_auto_compaction" or cmd == "set_steering_mode" or cmd == "set_follow_up_mode" {
+        send(command("get_state"))
+        return
+    }
+    if cmd == "compact" {
+        S.compacting = false
+        send(command("get_session_stats"))
+        return
+    }
+    if cmd == "get_available_models" {
+        S.models = data.at("models").list()
+        return
+    }
+    if cmd == "get_available_thinking_levels" {
+        S.levels = stringList(data.at("levels"))
+        return
+    }
+    if cmd == "get_messages" {
+        loadHistory(data.at("messages").list())
+        send(command("get_fork_messages"))
+        return
+    }
+    if cmd == "get_session_stats" {
+        S.stats = data
+        S.tokens = data.at("tokens").at("total").asInt()
+        S.cost = data.at("cost").asNum()
+        let usage = data.at("contextUsage")
+        S.contextPercent = if usage.at("percent").kind == JsonKind.Number { usage.at("percent").asNum() } else { 0.0 - 1.0 }
+        return
+    }
+    if cmd == "set_model" {
+        S.provider = data.at("provider").asStr()
+        S.modelId = data.at("id").asStr()
+        S.modelName = data.at("name").asStr()
+        S.contextWindow = data.at("contextWindow").asInt()
+        send(command("get_available_thinking_levels"))
+        send(command("get_state"))
+        return
+    }
+    if cmd == "set_thinking_level" {
+        send(command("get_state"))
+        return
+    }
+    if cmd == "new_session" or cmd == "switch_session" {
+        if data.at("cancelled").asBool() { return }
+        S.messages = []
+        S.steering = []
+        S.followUp = []
+        send(command("get_state"))
+        send(command("get_messages"))
+        send(command("get_session_stats"))
+        refreshSessions()
+        return
+    }
+    if cmd == "prompt" {
+        if data.at("disposition").asStr() == "queued" { toast("Queued — pi will read it after the current step", "info") }
+        return
+    }
+}
+
+// ---- user actions ----
+
+fn submitPrompt(asFollowUp: bool) {
+    let message = S.composer.trim()
+    if message == "" and S.images.len() == 0 { return }
+    if not S.connected {
+        toast("pi is not running", "error")
+        return
+    }
+    S.history.push(message)
+    S.historyIndex = 0 - 1
+    // !command runs in the shell; !!command keeps the output out of the model's context
+    if message.startsWith("!") {
+        let exclude = message.startsWith("!!")
+        let shellCommand = message.sub(if exclude { 2 } else { 1 }, message.len()).trim()
+        if shellCommand != "" {
+            if S.bashRunning {
+                toast("A shell command is already running", "warning")
+                return
+            }
+            let m = addMsg("bash", "$ " + shellCommand + (if exclude { "   (not sent to the model)" } else { "" }) + "\n")
+            S.bashMsgId = m.id
+            m.startedAt = nowMs()
+            S.bashRunning = true
+            send(jobj(["type", "command", "excludeFromContext"], [jstr("bash"), jstr(shellCommand), jbool(exclude)]))
+            S.composer = ""
+            scrollToEnd("chat")
+            invalidate()
+            return
+        }
+    }
+    // a slash command the desktop handles itself
+    if message.startsWith("/") and runBuiltinCommand(message) {
+        S.composer = ""
+        invalidate()
+        return
+    }
+    var fields = jobj(["type", "message"], [jstr("prompt"), jstr(message)])
+    if S.images.len() > 0 {
+        var images: [Json] = []
+        for image in S.images { images.push(jobj(["type", "data", "mimeType"], [jstr("image"), jstr(image.data), jstr(image.mime)])) }
+        fields = fields.set("images", jarr(images))
+        S.images = []
+    }
+    if S.running { fields = fields.set("streamingBehavior", jstr(if asFollowUp { "followUp" } else { "steer" })) }
+    send(fields)
+    S.composer = ""
+    S.lastPromptAt = nowMs()
+    scrollToEnd("chat")
+    invalidate()
+}
+
+// Escape, as in the CLI: stop a shell command or the run, and put queued
+// messages back in the editor
+fn abortRun() {
+    if S.bashRunning {
+        send(command("abort_bash"))
+        return
+    }
+    if S.retryNote != "" { send(command("abort_retry")) }
+    if not S.running { return }
+    if S.steering.len() > 0 or S.followUp.len() > 0 {
+        S.panelArg = "abort-after-clear"
+        send(command("clear_queue"))
+    } else {
+        send(command("abort"))
+    }
+    toast("Stopping…", "info")
+}
+
+fn restoreQueue() {
+    if S.steering.len() == 0 and S.followUp.len() == 0 { return }
+    send(command("clear_queue"))
+}
+
+fn newSession() {
+    send(command("new_session"))
+    S.popup = ""
+}
+
+fn openSession(path: str) {
+    if path == S.sessionFile { return }
+    send(jobj(["type", "sessionPath"], [jstr("switch_session"), jstr(path)]))
+}
+
+fn isLocalProvider(provider: str) -> bool { return provider == "fable-local" or provider == "ninfer-local" }
+
+fn chooseModel(provider: str, id: str) {
+    S.popup = ""
+    if provider == S.provider and id == S.modelId { return }
+    // local models run as their own services, which the pi wrapper starts at
+    // launch: switching between them means restarting pi on this session
+    if (isLocalProvider(provider) or isLocalProvider(S.provider)) and provider != S.provider {
+        let session = S.sessionFile
+        var extra = ["--provider", provider, "--model", id]
+        if session != "" {
+            extra.push("--session")
+            extra.push(session)
+        }
+        toast("Restarting pi with {provider}/{id}…", "info")
+        restartPi(extra)
+        return
+    }
+    send(jobj(["type", "provider", "modelId"], [jstr("set_model"), jstr(provider), jstr(id)]))
+}
+
+fn chooseThinking(level: str) {
+    S.popup = ""
+    send(jobj(["type", "level"], [jstr("set_thinking_level"), jstr(level)]))
+}
+
+fn compactNow() {
+    send(command("compact"))
+    S.compacting = true
+}
+
+// ---- sessions on disk ----
+
+fn sessionsDirectory() -> str {
+    var encoded = S.cwd
+    if encoded.startsWith("/") { encoded = encoded.sub(1, encoded.len()) }
+    return S.home + "/.pi/agent/sessions/--" + encoded.replace("/", "-") + "--"
+}
+
+// days since 1970-01-01 for a civil date (Howard Hinnant's algorithm)
+fn daysFromCivil(year: int, month: int, day: int) -> int {
+    let y = if month <= 2 { year - 1 } else { year }
+    let era = (if y >= 0 { y } else { y - 399 }) / 400
+    let yoe = y - era * 400
+    let mp = (month + 9) % 12
+    let doy = (153 * mp + 2) / 5 + day - 1
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+    return era * 146097 + doe - 719468
+}
+
+fn digitsAt(t: str, lo: int, hi: int) -> int {
+    var v = 0
+    for i in lo..hi {
+        let b = t.byte(i)
+        if b < 48 or b > 57 { return 0 }
+        v = v * 10 + (b - 48)
+    }
+    return v
+}
+
+// "2026-10-05T08-17-36-478Z_<uuid>.jsonl" -> ms since the epoch
+fn sessionEpoch(name: str) -> int {
+    if name.len() < 19 { return 0 }
+    let days = daysFromCivil(digitsAt(name, 0, 4), digitsAt(name, 5, 7), digitsAt(name, 8, 10))
+    return ((days * 24 + digitsAt(name, 11, 13)) * 60 + digitsAt(name, 14, 16)) * 60000 + digitsAt(name, 17, 19) * 1000
+}
+
+fn ago(epoch: int) -> str {
+    let seconds = (nowMs() - epoch) / 1000
+    if seconds < 60 { return "just now" }
+    if seconds < 3600 { return "{seconds / 60}m ago" }
+    if seconds < 86400 { return "{seconds / 3600}h ago" }
+    if seconds < 604800 { return "{seconds / 86400}d ago" }
+    return "{seconds / 604800}w ago"
+}
+
+fn sessionTitle(path: str) -> str {
+    let content = readFile(path)
+    var title = ""
+    // the newest name set with set_session_name wins
+    var at = content.indexOf("\"type\":\"session_info\"")
+    while at >= 0 {
+        let lineEnd = mdFind(content, "\n", at)
+        let lineStart = lastNewline(content, at)
+        if let entry = parseJsonText(content.sub(lineStart, if lineEnd < 0 { content.len() } else { lineEnd })) {
+            if entry.at("name").asStr() != "" { title = entry.at("name").asStr() }
+        }
+        let next = mdFind(content, "\"type\":\"session_info\"", at + 10)
+        at = next
+    }
+    if title != "" { return title }
+    let userAt = content.indexOf("\"role\":\"user\"")
+    if userAt < 0 { return "Empty session" }
+    let lineStart = lastNewline(content, userAt)
+    let lineEnd = mdFind(content, "\n", userAt)
+    if let entry = parseJsonText(content.sub(lineStart, if lineEnd < 0 { content.len() } else { lineEnd })) {
+        let t = contentText(entry.at("message").at("content")).replace("\n", " ").trim()
+        if t != "" { return t }
+    }
+    return "Untitled"
+}
+
+fn lastNewline(content: str, before: int) -> int {
+    var i = before
+    while i > 0 and content.byte(i - 1) != 10 { i -= 1 }
+    return i
+}
+
+fn refreshSessions() {
+    let directory = sessionsDirectory()
+    var found: [SessionInfo] = []
+    if fileExists(directory) {
+        var names = listDirectory(directory)
+        names.sort()
+        var i = names.len() - 1
+        while i >= 0 and found.len() < 60 {
+            let name = names[i]
+            if name.endsWith(".jsonl") {
+                let path = directory + "/" + name
+                found.push(SessionInfo{path: path, title: sessionTitle(path), stamp: name, epoch: sessionEpoch(name)})
+            }
+            i -= 1
+        }
+    }
+    S.sessions = found
+}
+
+// ---- the live file: what pi is reading or writing, as it happens ----
+
+struct LiveEdit { oldText: str = "", newText: str = "", done: bool = false }
+
+struct LiveFile {
+    path: str                  // absolute
+    tool: str                  // write, edit, read, view
+    toolId: str = ""
+    base: str = ""             // the file before the tool ran
+    existed: bool = false
+    tooBig: bool = false
+    content: str = ""          // write: the new content so far
+    edits: [LiveEdit] = []
+    after: str = ""            // the file once the tool finished
+    phase: int = 0             // 0 arguments streaming, 1 running, 2 done, 3 failed
+    line: int = 0              // read: first line asked for (1-based, 0 = start)
+    version: int = 0
+}
+
+const LIVE_MAX_BYTES = 2000000
+
+fn livePath(p: str) -> str {
+    if p.startsWith("~/") { return S.home + p.sub(1, p.len()) }
+    if p.startsWith("/") or S.cwd == "" { return p }
+    return S.cwd + "/" + p
+}
+
+// (text, exists, too big)
+fn liveRead(path: str) -> (str, bool, bool) {
+    if not isFile(path) { return ("", false, false) }
+    if fileSize(path) > LIVE_MAX_BYTES { return ("", true, true) }
+    return (readFile(path), true, false)
+}
+
+fn liveTouch(path: str) {
+    var kept: [str] = [path]
+    for p in S.touched {
+        if p != path and kept.len() < 12 { kept.push(p) }
+    }
+    S.touched = kept
+}
+
+fn liveBegin(b: Block, path: str) -> LiveFile {
+    if let lf = S.live {
+        if lf.toolId == b.toolId and lf.toolId != "" { return lf }
+    }
+    let full = livePath(path)
+    let (text, exists, big) = liveRead(full)
+    let lf = LiveFile{path: full, tool: b.toolName, toolId: b.toolId, base: text, existed: exists, tooBig: big}
+    S.live = lf
+    liveTouch(full)
+    if S.dock == "" and S.dockFollow and b.toolName != "read" { S.dock = "file" }
+    return lf
+}
+
+// show any file in the dock (the touched-file chips)
+fn liveView(path: str) {
+    let (text, exists, big) = liveRead(path)
+    S.live = LiveFile{path: path, tool: "view", base: text, existed: exists, tooBig: big, phase: 2, after: text}
+    S.dock = "file"
+    invalidate()
+}
+
+fn liveFromStream(b: Block) {
+    let fields = partialJsonFields(b.text)
+    var path = ""
+    for f in fields {
+        if (f.key == "path" or f.key == "file_path") and f.complete { path = f.value }
+    }
+    if path == "" { return }
+    let lf = liveBegin(b, path)
+    if b.toolName == "write" {
+        for f in fields {
+            if f.key == "content" { lf.content = f.value }
+        }
+    } else {
+        var edits: [LiveEdit] = []
+        for f in fields {
+            if f.key == "oldText" or f.key == "old_string" { edits.push(LiveEdit{oldText: f.value}) }
+            else if (f.key == "newText" or f.key == "new_string") and edits.len() > 0 {
+                edits[edits.len() - 1].newText = f.value
+                edits[edits.len() - 1].done = f.complete
+            }
+        }
+        lf.edits = edits
+    }
+    lf.version += 1
+}
+
+fn liveFromArgs(b: Block) {
+    let name = b.toolName
+    if name != "write" and name != "edit" and name != "read" { return }
+    var path = b.args.at("path").asStr()
+    if path == "" { path = b.args.at("file_path").asStr() }
+    if path == "" { return }
+    let lf = liveBegin(b, path)
+    if name == "write" {
+        lf.content = b.args.at("content").asStr()
+    } else if name == "edit" {
+        var list = b.args.at("edits").list()
+        if list.len() == 0 { list = [b.args] }
+        var edits: [LiveEdit] = []
+        for e in list {
+            var o = e.at("oldText").asStr()
+            if o == "" { o = e.at("old_string").asStr() }
+            var n = e.at("newText").asStr()
+            if n == "" and not e.has("newText") { n = e.at("new_string").asStr() }
+            edits.push(LiveEdit{oldText: o, newText: n, done: true})
+        }
+        lf.edits = edits
+    } else {
+        lf.line = b.args.at("offset").asInt()
+        lf.after = lf.base
+    }
+    lf.phase = max(lf.phase, 1)
+    lf.version += 1
+}
+
+fn liveFinish(b: Block) {
+    if let lf = S.live {
+        if lf.toolId != b.toolId { return }
+        lf.phase = b.status
+        if lf.tool != "read" {
+            let (text, exists, big) = liveRead(lf.path)
+            lf.after = text
+            lf.tooBig = big
+        }
+        lf.version += 1
+    }
+}
+
+// tokens per second since the first streamed token (decode speed, not
+// prefill); falls back to ~4 bytes a token when the provider reports no usage
+fn tpsSample(chars: int, outputTokens: int) {
+    let now = nowMs()
+    if S.tpsStart == 0 {
+        if chars == 0 { return }
+        S.tpsStart = now
+    }
+    S.tpsChars += chars
+    if outputTokens > 0 { S.tpsTokens = outputTokens }
+    let elapsed = now - S.tpsStart
+    if elapsed < 300 { return }
+    S.tpsEstimated = S.tpsTokens == 0
+    let tokens = if S.tpsEstimated { S.tpsChars / 4 } else { S.tpsTokens }
+    S.tps = (tokens as float) * 1000.0 / (elapsed as float)
+}

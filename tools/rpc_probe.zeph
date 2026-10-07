@@ -1,0 +1,42 @@
+// Spawns pi in RPC mode (the binary given as argument, so no model service
+// starts), asks for its state and models, and prints the responses.
+import "../lib/proc.zeph"
+import "../lib/json.zeph"
+
+let argv = args()
+let binary = if argv.len() > 1 { argv[1] } else { "pi" }
+let maybe = procSpawn([binary, "--mode", "rpc", "--no-session"])
+if not maybe.has() { panic("spawn failed") }
+let p = maybe.get()
+procWrite(p, jsonEncode(jobj(["id", "type"], [jstr("s1"), jstr("get_state")])) + "\n")
+procWrite(p, jsonEncode(jobj(["id", "type"], [jstr("m1"), jstr("get_available_models")])) + "\n")
+let deadline = SDL_GetTicks() + 20000
+var answered = 0
+while answered < 2 and SDL_GetTicks() < deadline {
+    for line in procLines(p) {
+        let parsed = parseJsonText(line)
+        if not parsed.has() {
+            print("unparsed:", line.sub(0, min(line.len(), 120)))
+            continue
+        }
+        let v = parsed.get()
+        if v.at("type").asStr() == "response" {
+            answered += 1
+            let data = v.at("data")
+            if v.at("id").asStr() == "s1" {
+                print("state: model", data.at("model").at("provider").asStr() + "/" + data.at("model").at("id").asStr(), "thinking", data.at("thinkingLevel").asStr(), "streaming", data.at("isStreaming").asBool())
+            } else {
+                var names: [str] = []
+                for m in data.at("models").list() { names.push(m.at("provider").asStr() + "/" + m.at("id").asStr()) }
+                print("models:", names.len(), names.join(", ").sub(0, min(names.join(", ").len(), 300)))
+            }
+        } else {
+            print("event:", v.at("type").asStr())
+        }
+    }
+    syscall(35, nativeAlloc(16), 0)            // nanosleep(0) placeholder
+}
+procCloseInput(p)
+var waited = 0
+while not procPoll(p) and waited < 200 { waited += 1 }
+print("stderr tail:", p.errTail.sub(0, min(p.errTail.len(), 300)))

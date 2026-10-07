@@ -1,0 +1,195 @@
+// Native bindings: SDL3 (window, input, GPU renderer), FreeType + fontconfig
+// (text), and a little libc (process spawning). All of it through `extern fn`,
+// which on --linux loads the library with dlopen on first use.
+//
+// Struct offsets were taken from the installed headers (SDL 3.4, FreeType 2.14)
+// with offsetof; they are the x86-64 System V layouts.
+import "std/bytes.zeph"
+
+extern fn SDL_Init(flags: int) -> bool from "libSDL3.so.0"
+extern fn SDL_Quit() from "libSDL3.so.0"
+extern fn SDL_GetError() -> int from "libSDL3.so.0"
+extern fn SDL_SetHint(name: int, value: int) -> bool from "libSDL3.so.0"
+extern fn SDL_CreateWindow(title: int, w: int, h: int, flags: int) -> int from "libSDL3.so.0"
+extern fn SDL_SetWindowTitle(window: int, title: int) -> bool from "libSDL3.so.0"
+extern fn SDL_SetWindowMinimumSize(window: int, w: int, h: int) -> bool from "libSDL3.so.0"
+extern fn SDL_GetWindowSize(window: int, w: int, h: int) -> bool from "libSDL3.so.0"
+extern fn SDL_GetWindowSizeInPixels(window: int, w: int, h: int) -> bool from "libSDL3.so.0"
+extern fn SDL_GetDisplayForWindow(window: int) -> int from "libSDL3.so.0"
+extern fn SDL_GetCurrentDisplayMode(display: int) -> int from "libSDL3.so.0"
+extern fn SDL_CreateRenderer(window: int, name: int) -> int from "libSDL3.so.0"
+extern fn SDL_SetRenderVSync(renderer: int, vsync: int) -> bool from "libSDL3.so.0"
+extern fn SDL_SetRenderDrawColor(renderer: int, r: int, g: int, b: int, a: int) -> bool from "libSDL3.so.0"
+extern fn SDL_RenderClear(renderer: int) -> bool from "libSDL3.so.0"
+extern fn SDL_RenderPresent(renderer: int) -> bool from "libSDL3.so.0"
+extern fn SDL_SetRenderClipRect(renderer: int, rect: int) -> bool from "libSDL3.so.0"
+extern fn SDL_RenderGeometry(renderer: int, texture: int, vertices: int, count: int, indices: int, indexCount: int) -> bool from "libSDL3.so.0"
+extern fn SDL_CreateTexture(renderer: int, format: int, access: int, w: int, h: int) -> int from "libSDL3.so.0"
+extern fn SDL_UpdateTexture(texture: int, rect: int, pixels: int, pitch: int) -> bool from "libSDL3.so.0"
+extern fn SDL_SetTextureBlendMode(texture: int, mode: int) -> bool from "libSDL3.so.0"
+extern fn SDL_SetTextureScaleMode(texture: int, mode: int) -> bool from "libSDL3.so.0"
+extern fn SDL_WaitEventTimeout(event: int, ms: int) -> bool from "libSDL3.so.0"
+extern fn SDL_PollEvent(event: int) -> bool from "libSDL3.so.0"
+extern fn SDL_StartTextInput(window: int) -> bool from "libSDL3.so.0"
+extern fn SDL_SetTextInputArea(window: int, rect: int, cursor: int) -> bool from "libSDL3.so.0"
+extern fn SDL_SetClipboardText(text: int) -> bool from "libSDL3.so.0"
+extern fn SDL_GetClipboardText() -> int from "libSDL3.so.0"
+extern fn SDL_HasClipboardData(mime: int) -> bool from "libSDL3.so.0"
+extern fn SDL_GetClipboardData(mime: int, size: int) -> int from "libSDL3.so.0"
+extern fn SDL_free(p: int) from "libSDL3.so.0"
+extern fn SDL_CreateSystemCursor(id: int) -> int from "libSDL3.so.0"
+extern fn SDL_SetCursor(cursor: int) -> bool from "libSDL3.so.0"
+extern fn SDL_RenderReadPixels(renderer: int, rect: int) -> int from "libSDL3.so.0"
+extern fn SDL_SaveBMP(surface: int, file: int) -> bool from "libSDL3.so.0"
+extern fn SDL_DestroySurface(surface: int) from "libSDL3.so.0"
+extern fn SDL_LoadBMP(file: int) -> int from "libSDL3.so.0"
+extern fn SDL_CreateTextureFromSurface(renderer: int, surface: int) -> int from "libSDL3.so.0"
+extern fn SDL_GetTextureSize(texture: int, w: int, h: int) -> bool from "libSDL3.so.0"
+extern fn SDL_RenderTexture(renderer: int, texture: int, src: int, dst: int) -> bool from "libSDL3.so.0"
+extern fn SDL_SetTextureAlphaMod(texture: int, alpha: int) -> bool from "libSDL3.so.0"     // (the Float variant takes a 32-bit float, which extern can't pass)
+extern fn SDL_GetTicks() -> int from "libSDL3.so.0"
+
+extern fn FT_Init_FreeType(library: int) -> i32 from "libfreetype.so.6"
+extern fn FT_New_Face(library: int, path: int, index: int, face: int) -> i32 from "libfreetype.so.6"
+extern fn FT_Set_Pixel_Sizes(face: int, w: int, h: int) -> i32 from "libfreetype.so.6"
+extern fn FT_Get_Char_Index(face: int, codepoint: int) -> i32 from "libfreetype.so.6"
+extern fn FT_Load_Glyph(face: int, glyph: int, flags: int) -> i32 from "libfreetype.so.6"
+
+extern fn FcInitLoadConfigAndFonts() -> int from "libfontconfig.so.1"
+extern fn FcNameParse(name: int) -> int from "libfontconfig.so.1"
+extern fn FcConfigSubstitute(config: int, pattern: int, kind: int) -> i32 from "libfontconfig.so.1"
+extern fn FcDefaultSubstitute(pattern: int) from "libfontconfig.so.1"
+extern fn FcFontSort(config: int, pattern: int, trim: int, charsets: int, result: int) -> int from "libfontconfig.so.1"
+extern fn FcPatternGetString(pattern: int, object: int, n: int, out: int) -> i32 from "libfontconfig.so.1"
+extern fn FcPatternGetInteger(pattern: int, object: int, n: int, out: int) -> i32 from "libfontconfig.so.1"
+
+extern fn posix_spawnp(pid: int, file: int, actions: int, attributes: int, argv: int, envp: int) -> i32 from "libc.so.6"
+extern fn posix_spawn_file_actions_init(actions: int) -> i32 from "libc.so.6"
+extern fn posix_spawn_file_actions_adddup2(actions: int, fd: int, target: int) -> i32 from "libc.so.6"
+extern fn signal(number: int, handler: int) -> int from "libc.so.6"
+extern fn memcpy(target: int, source: int, n: int) -> int from "libc.so.6"
+extern fn strlen(text: int) -> int from "libc.so.6"
+extern fn chdir(path: int) -> i32 from "libc.so.6"
+extern fn getenv(name: int) -> int from "libc.so.6"
+
+// SDL3 constants
+const SDL_INIT_VIDEO = 32
+const SDL_WINDOW_RESIZABLE = 32
+const SDL_WINDOW_HIGH_PIXEL_DENSITY = 8192
+const SDL_PIXELFORMAT_RGBA32 = 376840196
+const SDL_BLENDMODE_BLEND = 1
+const SDL_SCALEMODE_LINEAR = 1
+const SDL_EVENT_QUIT = 256
+const SDL_EVENT_WINDOW_EXPOSED = 516
+const SDL_EVENT_WINDOW_RESIZED = 518
+const SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED = 519
+const SDL_EVENT_WINDOW_MOUSE_LEAVE = 525
+const SDL_EVENT_WINDOW_FOCUS_GAINED = 526
+const SDL_EVENT_WINDOW_FOCUS_LOST = 527
+const SDL_EVENT_WINDOW_CLOSE_REQUESTED = 528
+const SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED = 532
+const SDL_EVENT_KEY_DOWN = 768
+const SDL_EVENT_TEXT_INPUT = 771
+const SDL_EVENT_MOUSE_MOTION = 1024
+const SDL_EVENT_MOUSE_BUTTON_DOWN = 1025
+const SDL_EVENT_MOUSE_BUTTON_UP = 1026
+const SDL_EVENT_MOUSE_WHEEL = 1027
+const SDL_EVENT_DROP_FILE = 4096
+const SDL_EVENT_DROP_TEXT = 4097
+const KEY_F1 = 1073741882
+const KEY_RETURN = 13
+const KEY_ESCAPE = 27
+const KEY_BACKSPACE = 8
+const KEY_TAB = 9
+const KEY_DELETE = 127
+const KEY_RIGHT = 1073741903
+const KEY_LEFT = 1073741904
+const KEY_DOWN = 1073741905
+const KEY_UP = 1073741906
+const KEY_HOME = 1073741898
+const KEY_END = 1073741901
+const KEY_PAGEUP = 1073741899
+const KEY_PAGEDOWN = 1073741902
+const KEY_KP_ENTER = 1073741912
+const MOD_SHIFT = 3
+const MOD_CTRL = 192
+const MOD_ALT = 768
+const CURSOR_DEFAULT = 0
+const CURSOR_TEXT = 1
+const CURSOR_POINTER = 11
+const CURSOR_NWSE = 5
+const CURSOR_NESW = 6
+const CURSOR_EW = 7
+const CURSOR_NS = 8
+const CURSOR_MOVE = 9
+
+// FreeType layout
+const FT_FACE_GLYPH = 152
+const FT_FACE_SIZE = 160
+const FT_SIZE_ASCENDER = 48          // FT_SizeRec.metrics (24) + FT_Size_Metrics.ascender (24)
+const FT_SIZE_DESCENDER = 56
+const FT_SIZE_HEIGHT = 64
+const FT_GLYPH_ADVANCE_X = 128
+const FT_GLYPH_BITMAP = 152
+const FT_GLYPH_LEFT = 192
+const FT_GLYPH_TOP = 196
+const FT_BITMAP_ROWS = 0
+const FT_BITMAP_WIDTH = 4
+const FT_BITMAP_PITCH = 8
+const FT_BITMAP_BUFFER = 16
+const FT_BITMAP_MODE = 26
+const FT_LOAD_RENDER = 4
+const FT_LOAD_TARGET_LIGHT = 65536
+
+// ---- memory and strings ----
+
+// off-heap memory (never freed): buffers C keeps or writes into
+fn nativeAlloc(n: int) -> int { return win("VirtualAlloc", 0, n, 12288, 4) }
+
+// a NUL-terminated copy of `text` in a reusable off-heap slot; valid until
+// the same slot is used again
+var cstrSlots: [int] = [0, 0, 0, 0, 0, 0, 0, 0]
+var cstrCapacities: [int] = [0, 0, 0, 0, 0, 0, 0, 0]
+fn cstrIn(slot: int, text: str) -> int {
+    let n = text.len()
+    if cstrCapacities[slot] < n + 1 {
+        var capacity = 256
+        while capacity < n + 1 { capacity = capacity * 2 }
+        cstrSlots[slot] = nativeAlloc(capacity)
+        cstrCapacities[slot] = capacity
+    }
+    let p = cstrSlots[slot]
+    if n > 0 { memcpy(p, strData(text), n) }
+    store8(p + n, 0)
+    return p
+}
+fn cstr(text: str) -> int { return cstrIn(0, text) }
+
+// a permanent NUL-terminated copy
+fn cstrKeep(text: str) -> int {
+    let p = nativeAlloc(text.len() + 1)
+    if text.len() > 0 { memcpy(p, strData(text), text.len()) }
+    store8(p + text.len(), 0)
+    return p
+}
+
+// address of a str's bytes (layout: [0] length, [8] bytes)
+fn strData(text: str) -> int { return addr(text) + 8 }
+
+// n bytes at p as a new str
+fn strFrom(p: int, n: int) -> str {
+    if n <= 0 { return "" }
+    if n == 1 { return chr(load8(p)) }
+    let text = " ".repeat(n)       // a fresh, unshared string; filled in place
+    memcpy(strData(text), p, n)
+    return text
+}
+
+fn strFromC(p: int) -> str {
+    if p == 0 { return "" }
+    return strFrom(p, strlen(p))
+}
+
+fn sdlError() -> str { return strFromC(SDL_GetError()) }
+
+fn envVar(name: str) -> str { return strFromC(getenv(cstr(name))) }

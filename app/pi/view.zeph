@@ -1,0 +1,1588 @@
+// The interface: session sidebar, header, the conversation, the composer with
+// command / file suggestions, a CLI-style footer, and overlay panels (command
+// palette, pickers, session info, settings, hotkeys, tree, dialogs, toasts).
+// Everything reads the global session state `S`.
+import "thumbs.zeph"
+
+// how wide the conversation and composer get (Settings → Conversation width)
+var chatWidthChoice = "Wide"
+fn chatMax() -> int {
+    if chatWidthChoice == "Narrow" { return 760 }
+    if chatWidthChoice == "Medium" { return 960 }
+    if chatWidthChoice == "Full" { return 100000 }
+    return 1200
+}
+
+// panel widths, dragged with the splitters and saved for next time
+var sidebarWidth = 272
+var dockPref = 500
+var layoutDragFrom = 0
+var layoutUnsaved = false
+
+fn truncate(t: str, limit: int) -> str {
+    if t.len() <= limit { return t }
+    var cut = limit
+    while cut > 0 and not utf8Boundary(t, cut) { cut -= 1 }
+    return t.sub(0, cut) + "…"
+}
+
+// keep the end of a path, which says more than its start
+fn truncateLeft(t: str, limit: int) -> str {
+    if t.len() <= limit { return t }
+    var cut = t.len() - limit + 1
+    while cut < t.len() and not utf8Boundary(t, cut) { cut += 1 }
+    return "…" + t.sub(cut, t.len())
+}
+
+fn firstLine(t: str) -> str {
+    let at = t.indexOf("\n")
+    if at < 0 { return t }
+    return t.sub(0, at)
+}
+
+fn shortPath(path: str) -> str {
+    if S.home != "" and path.startsWith(S.home) { return "~" + path.sub(S.home.len(), path.len()) }
+    return path
+}
+
+fn tailLines(t: str, count: int) -> (str, int) {
+    let lines = t.split("\n")
+    if lines.len() <= count { return (t, 0) }
+    var kept: [str] = []
+    for i in lines.len() - count..lines.len() { kept.push(lines[i]) }
+    return (kept.join("\n"), lines.len() - count)
+}
+fn headLines(t: str, count: int) -> (str, int) {
+    let lines = t.split("\n")
+    if lines.len() <= count { return (t, 0) }
+    var kept: [str] = []
+    for i in 0..count { kept.push(lines[i]) }
+    return (kept.join("\n"), lines.len() - count)
+}
+
+// drop terminal colour codes (ESC [ ... letter) from tool output
+fn stripAnsi(t: str) -> str {
+    if t.indexOf("\x1b") < 0 { return t }
+    var parts: [str] = []
+    var start = 0
+    var i = 0
+    while i < t.len() {
+        if t.byte(i) == 27 {
+            parts.push(t.sub(start, i))
+            i += 1
+            if i < t.len() and t.byte(i) == 91 {
+                i += 1
+                while i < t.len() and not (t.byte(i) >= 64 and t.byte(i) <= 126) { i += 1 }
+            }
+            i += 1
+            start = i
+        } else {
+            i += 1
+        }
+    }
+    parts.push(t.sub(min(start, t.len()), t.len()))
+    return parts.join()
+}
+
+fn compactNumber(n: int) -> str {
+    if n >= 1000000 { return "{n / 1000000}.{(n / 100000) % 10}M" }
+    if n >= 1000 { return "{n / 1000}.{(n / 100) % 10}k" }
+    return "{n}"
+}
+
+fn formatCost(c: float) -> str {
+    let cents = (c * 100.0 + 0.5) as int
+    let rest = cents % 100
+    return "{cents / 100}." + (if rest < 10 { "0" } else { "" }) + "{rest}"
+}
+
+fn copyAndTell(t: str) {
+    copyText(t)
+    toast("Copied", "info")
+}
+
+fn sessionTitleNow() -> str {
+    if S.sessionName != "" { return S.sessionName }
+    for m in S.messages {
+        if m.role == "user" { return truncate(firstLine(m.text), 80) }
+    }
+    return "New session"
+}
+
+fn spinnerGlyph() -> str {
+    let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    return frames[S.spinner % frames.len()]
+}
+
+fn withHoverOnly(el: El) -> El {
+    el.hoverOnly = true
+    return el
+}
+
+fn asHoverGroup(el: El) -> El {
+    el.hoverGroup = true
+    return el
+}
+
+// ---- sidebar ----
+
+fn dayGroup(epoch: int) -> str {
+    let days = (nowMs() - epoch) / 86400000
+    if days < 1 { return "Today" }
+    if days < 2 { return "Yesterday" }
+    if days < 7 { return "This week" }
+    return "Older"
+}
+
+fn sessionItem(info: SessionInfo) -> El {
+    let path = info.path
+    let current = path == S.sessionFile
+    let item = clickable(st().row().alignTo(START).gapOf(8).padXY(10, 8).round(8).fill(if current { C_PANEL_HI } else { 0 }).hover(C_PANEL), [
+        box(st().flex(1).gapOf(3), [
+            label(truncate(info.title, 64), F_UI, if current { C_TEXT } else { C_TEXT_SOFT }),
+            label(ago(info.epoch), F_SMALL, C_FAINT)
+        ]),
+        withHoverOnly(withTip(clickable(st().padXY(5, 3).round(5).hover(C_BAD_SOFT), [iconSmall(I_TRASH, C_FAINT)], fn() {
+            S.panelArg = path
+            openPanel("delete")
+        }), "Delete session"))
+    ], fn() { openSession(path) })
+    return withKey(asHoverGroup(item), path)
+}
+
+fn sidebarView() -> El {
+    var items: [El] = []
+    var lastGroup = ""
+    let filter = S.sessionFilter.lower()
+    for info in S.sessions {
+        if filter != "" and info.title.lower().indexOf(filter) < 0 { continue }
+        let group = dayGroup(info.epoch)
+        if group != lastGroup {
+            items.push(box(st().padTo(10, if lastGroup == "" { 2 } else { 12 }, 0, 4), [label(group.upper(), F_SMALL_BOLD, C_FAINT)]))
+            lastGroup = group
+        }
+        items.push(sessionItem(info))
+    }
+    if items.len() == 0 {
+        items.push(box(st().padXY(10, 8), [label(if filter != "" { "No sessions match." } else { "No saved sessions in this folder yet." }, F_SMALL, C_FAINT)]))
+    }
+    let search = input("session-filter", st().padXY(2, 7).fontOf(F_UI).fg(C_TEXT),
+        S.sessionFilter, "Search sessions", fn(t: str) { S.sessionFilter = t }, fn(t: str) { })
+    return box(st().w(sidebarWidth).fill(C_SIDEBAR).padTo(12, 22, 8, 10).gapOf(10), [
+        box(st().row().alignTo(CENTER).gapOf(10).padTo(4, 0, 0, 0), [
+            box(st().w(28).h(28).round(8).fill(C_ACCENT).alignTo(CENTER).justifyTo(CENTER), [label("π", F_H2, C_ON_ACCENT)]),
+            label("pi", F_H1, C_TEXT),
+            spacer(),
+            withTip(iconButton(I_LEFT, C_FAINT, fn() { S.sidebar = false }), "Hide sidebar · Ctrl+B")
+        ]),
+        clickable(st().row().alignTo(CENTER).gapOf(10).padXY(12, 9).round(9).fill(C_ACCENT_DIM).hover(C_ACCENT_SOFT), [
+            icon(I_PLUS, C_ACCENT_HI),
+            label("New session", F_UI_BOLD, C_ACCENT_HI),
+            spacer(),
+            label("Ctrl+N", F_SMALL, C_FAINT)
+        ], fn() { newSession() }),
+        box(st().row().alignTo(CENTER).gapOf(8).padTo(10, 0, 4, 0).fill(C_PANEL).round(8), [iconSmall(I_SEARCH, C_FAINT), box(st().flex(1), [search])]),
+        scroll("sessions", st().flex(1).gapOf(2).padTo(0, 0, 6, 0), items, false),
+        box(st().row().alignTo(CENTER).gapOf(4).padTo(4, 4, 0, 0), [
+            iconSmall(I_FOLDER, C_FAINT),
+            box(st().flex(1).padTo(4, 0, 0, 0).clipped(), [label(truncateLeft(shortPath(S.cwd), max((sidebarWidth - 110) / 7, 12)), F_SMALL, C_FAINT)]),
+            withTip(iconButton(I_KEYBOARD, C_FAINT, fn() { openPanel("hotkeys") }), "Keyboard shortcuts · F1"),
+            withTip(iconButton(I_COG, C_FAINT, fn() { openPanel("settings") }), "Settings")
+        ])
+    ])
+}
+
+// ---- header ----
+
+fn statusPill(text: str, color: int) -> El {
+    var parts: [El] = [spinner(14, color)]
+    if text != "" { parts.push(label(text, F_SMALL_BOLD, color)) }
+    return exitFade(presence("status-" + text, ENTER_FADE, box(st().row().alignTo(CENTER).gapOf(8).padXY(10, 5).round(14).fill(tint(color, 0x14)), parts)))
+}
+
+fn headerChip(glyph: str, content: str, color: int, onClick: fn()) -> El {
+    return clickable(st().row().alignTo(CENTER).gapOf(7).padXY(10, 6).round(8).fill(C_PANEL).hover(C_PANEL_HI).outline(0xffffff0a, 1), [
+        iconSmall(glyph, color),
+        label(content, F_SMALL, C_TEXT),
+        iconSmall(I_DOWN, C_FAINT)
+    ], onClick)
+}
+
+fn headerView() -> El {
+    var parts: [El] = []
+    if not sidebarShown() {
+        parts.push(iconBtn(I_BARS, "Show sidebar · Ctrl+B", false, fn() {
+            S.sidebar = true
+            if not sidebarShown() { S.dock = "" }        // no room for both
+        }))
+    }
+    parts.push(box(st().flex(1).minWidth(160).clipped(), [
+        asHoverGroup(clickable(st().row().alignTo(CENTER).gapOf(8).padXY(8, 5).round(7).hover(C_PANEL), [
+            label(truncate(sessionTitleNow(), if chatWidth() < 1000 { 28 } else { 110 }), F_UI_BOLD, C_TEXT),
+            withHoverOnly(iconSmall(I_PENCIL, C_FAINT))
+        ], fn() { openPanel("rename") }))
+    ]))
+    let roomy = chatWidth() >= 1000
+    if S.compacting { parts.push(statusPill(if roomy { "Compacting" } else { "" }, C_WARN)) }
+    else if S.bashRunning { parts.push(statusPill(if roomy { "Running command" } else { "" }, C_INFO)) }
+    else if S.running { parts.push(statusPill(if roomy { "Working" } else { "" }, C_ACCENT_HI)) }
+    let narrow = chatWidth() < 820
+    if not narrow { for el in telemetryPill() { parts.push(el) } }
+    let modelText = if S.modelName != "" { S.modelName } else if S.modelId != "" { S.modelId } else { "Choose model" }
+    parts.push(headerChip(I_CHIP, truncate(modelText, 40), C_ACCENT_HI, fn() { openPanel("model") }))
+    if S.levels.len() > 1 or (S.thinking != "" and S.thinking != "off") {
+        parts.push(headerChip(I_BULB, S.thinking, thinkingColor(S.thinking), fn() { openPanel("thinking") }))
+    }
+    parts.push(box(st().row().alignTo(CENTER).gapOf(2).padTo(4, 0, 0, 0), headerTools()))
+    let top = box(st().row().alignTo(CENTER).gapOf(8).padTo(16, 14, 16, 6).h(66), parts)
+    // a narrow window gets the telemetry on a second row
+    let chips = telemetryPill()
+    if not narrow or chips.len() == 0 { return top }
+    return box(st(), [top, box(st().row().alignTo(CENTER).gapOf(8).padTo(16, 0, 16, 8), chips)])
+}
+
+fn headerTools() -> [El] {
+    var tools: [El] = [
+        iconBtn(I_DATABASE, "Context breakdown · Ctrl+I", S.dock == "context", fn() { toggleDock("context") }),
+        iconBtn(I_FILE_TEXT, "Live file view · Ctrl+E", S.dock == "file", fn() { toggleDock("file") }),
+        iconBtn(I_BOOK, "Memory vault · Ctrl+M", S.dock == "memory", fn() { toggleDock("memory") })
+    ]
+    if appsCount() > 0 {
+        tools.push(iconBtn(I_WIN_RESTORE, if appsShownNow() { "Minimize app windows" } else { "Show app windows ({appsCount()})" }, appsShownNow(), fn() { appsToggle() }))
+    }
+    tools.push(iconBtn(I_SEARCH, "Command palette · Ctrl+K", false, fn() { openPanel("palette") }))
+    return tools
+}
+
+// generation speed, context fill and cost, beside the model picker
+// the sidebar steps aside when the window is too narrow for it, the dock and
+// a readable conversation
+fn sidebarShown() -> bool {
+    if not S.sidebar { return false }
+    return viewW - dockSpace() - sidebarWidth - 1 >= 560
+}
+
+fn chatWidth() -> int {
+    var w = viewW
+    if sidebarShown() { w -= sidebarWidth + 1 }
+    return w - dockSpace()
+}
+
+// one segment of the telemetry pill
+fn statChip(children: [El], onClick: fn()) -> El {
+    return clickable(st().row().alignTo(CENTER).gapOf(8).padXY(10, 6).round(7).hover(C_PANEL_HI), children, onClick)
+}
+
+// the telemetry segments joined into one pill, divided by hairlines
+fn telemetryPill() -> [El] {
+    let chips = telemetryChips()
+    if chips.len() == 0 { return [] }
+    var parts: [El] = []
+    for i, c in chips {
+        if i > 0 { parts.push(vrule(16)) }
+        parts.push(c)
+    }
+    return [box(st().row().alignTo(CENTER).gapOf(1).pad(1).round(9).fill(C_PANEL).outline(0xffffff0a, 1), parts)]
+}
+
+fn telemetryChips() -> [El] {
+    var out: [El] = []
+    if S.tps >= 0.0 {
+        let live = S.running and S.tpsStart > 0
+        let color = if live { C_ACCENT_HI } else { C_MUTED }
+        out.push(withTip(statChip([iconSmall(I_BOLT, color), label(tpsText(), F_SMALL_BOLD, if live { C_TEXT } else { C_TEXT_SOFT })], fn() { }), if S.tpsEstimated { "Generation speed (estimated)" } else { "Generation speed" }))
+    }
+    if S.contextPercent >= 0.0 {
+        let pct = (S.contextPercent + 0.5) as int
+        let color = if pct >= 85 { C_BAD } else if pct >= 65 { C_WARN } else { C_ACCENT }
+        let used = S.stats.at("contextUsage").at("tokens").asInt()
+        // with the sidebar and the dock both open there's less room: drop the counts
+        let compact = chatWidth() < 1000
+        let meterW = if compact { 44 } else { 70 }
+        var meter: [El] = [
+            iconSmall(I_DATABASE, color),
+            box(st().w(meterW).h(6).round(3).fill(C_PANEL_TOP), [box(st().w(max(min(pct, 100) * meterW / 100, 1)).h(6).round(3).fill(color), [])]),
+            label("{pct}%", F_SMALL_BOLD, if pct >= 65 { color } else { C_TEXT_SOFT })
+        ]
+        if not compact { meter.push(label(compactNumber(used) + " / " + compactNumber(S.contextWindow), F_SMALL, C_MUTED)) }
+        out.push(withTip(statChip(meter, fn() { toggleDock("context") }), "Context window · click for the breakdown"))
+    }
+    if S.cost > 0.0 { out.push(withTip(statChip([label("$" + formatCost(S.cost), F_SMALL_BOLD, C_TEXT_SOFT)], fn() { openPanel("session") }), "Session cost · click for details")) }
+    return out
+}
+
+fn tpsText() -> str {
+    let tenths = (S.tps * 10.0 + 0.5) as int
+    let value = if tenths >= 1000 { "{tenths / 10}" } else { "{tenths / 10}.{tenths % 10}" }
+    return (if S.tpsEstimated { "~" } else { "" }) + value + " tok/s"
+}
+
+// ---- footer (the CLI's status line) ----
+
+fn footerView() -> El {
+    var parts: [El] = [
+        iconSmall(I_FOLDER, C_FAINT),
+        label(truncate(shortPath(S.cwd), 50), F_SMALL, C_FAINT)
+    ]
+    if S.sessionFile != "" {
+        parts.push(label("·", F_SMALL, C_FAINT))
+        parts.push(label(truncate(sessionTitleNow(), 40), F_SMALL, C_FAINT))
+    }
+    return box(st().row().alignTo(CENTER).gapOf(8).padXY(18, 10).h(38), parts)
+}
+
+fn runCommandText(t: str) {
+    S.composer = t
+    submitPrompt(false)
+}
+
+// ---- conversation ----
+
+fn smallAction(glyph: str, text: str, onClick: fn()) -> El {
+    return clickable(st().row().alignTo(CENTER).gapOf(5).padXY(7, 3).round(6).hover(C_PANEL), [iconSmall(glyph, C_FAINT), label(text, F_SMALL, C_FAINT)], onClick)
+}
+
+fn userView(m: Msg) -> El {
+    let text = m.text
+    var actions: [El] = [
+        smallAction(I_COPY, "Copy", fn() { copyAndTell(text) }),
+        smallAction(I_EDIT, "Edit", fn() {
+            S.composer = text
+            requestFocus("composer")
+        })
+    ]
+    var entry = ""
+    for f in S.forkMessages {
+        if f.at("text").asStr() == text { entry = f.at("entryId").asStr() }
+    }
+    if entry != "" {
+        let id = entry
+        actions.push(smallAction(I_FORK, "Fork", fn() { send(jobj(["type", "entryId"], [jstr("fork"), jstr(id)])) }))
+    }
+    var parts: [El] = []
+    if m.images.len() > 0 {
+        var pictures: [El] = [spacer()]
+        for a in m.images {
+            let picture = a
+            pictures.push(thumbView(a, 240, 180, fn() { openImage(picture) }))
+        }
+        parts.push(box(st().row().gapOf(8), pictures))
+    }
+    if text != "" {
+        parts.push(box(st().row(), [
+            spacer(),
+            box(st().maxWidth(max(chatMax() * 3 / 4, 560)).fill(C_USER_BG).round(16).padXY(15, 10).outline(C_USER_BORDER, 1), [
+                textStyled(st().fontOf(F_UI).fg(C_TEXT), text)
+            ])
+        ]))
+    }
+    parts.push(withHoverOnly(box(st().row().gapOf(2), actions)))
+    return asHoverGroup(box(st().gapOf(6).alignTo(END), parts))
+}
+
+fn thinkingView(b: Block, streaming: bool) -> El {
+    let title = if streaming { "Thinking" } else { "Thought" }
+    var children: [El] = [
+        clickable(st().row().alignTo(CENTER).gapOf(8).padXY(8, 4).round(7).hover(C_PANEL), [
+            iconSmall(I_BULB, if streaming { C_ACCENT_HI } else { C_FAINT }),
+            label(title, F_SMALL_BOLD, if streaming { C_MUTED } else { C_FAINT }),
+            if streaming { spinner(13, C_ACCENT) } else { label("~{max(b.text.len() / 4, 1)} tokens", F_SMALL, C_FAINT) },
+            iconSmall(if b.expanded { I_DOWN } else { I_RIGHT }, C_FAINT)
+        ], fn() { b.expanded = not b.expanded })
+    ]
+    if b.expanded {
+        children.push(box(st().row().gapOf(12).padTo(14, 2, 0, 2), [
+            box(st().w(2).fill(C_BORDER).round(1), []),
+            box(st().flex(1), [label(b.text.trim(), F_UI_ITALIC, C_FAINT)])
+        ]))
+    } else if streaming {
+        let preview = tailLines(b.text.trim(), 2).0
+        if preview != "" { children.push(box(st().padTo(34, 0, 0, 0), [label(truncate(preview, 300), F_SMALL, C_FAINT)])) }
+    }
+    return box(st().gapOf(4), children)
+}
+
+fn argString(b: Block, key: str) -> str { return b.args.at(key).asStr() }
+
+fn toolIcon(name: str) -> str {
+    if name == "bash" { return I_TERMINAL }
+    if name == "read" { return I_FILE_TEXT }
+    if name == "edit" { return I_EDIT }
+    if name == "write" { return I_PENCIL }
+    if name == "grep" or name == "find" or name == "tool_search" { return I_SEARCH }
+    if name == "ls" { return I_FOLDER_OPEN }
+    if name.contains("browser") or name.contains("web") or name.contains("fetch") { return I_GLOBE }
+    if name.startsWith("mcp") { return I_PUZZLE }
+    if name.startsWith("memory_") { return I_BOOK }
+    return I_BOLT
+}
+
+fn toolSummary(b: Block) -> str {
+    let name = b.toolName
+    if name == "bash" { return firstLine(argString(b, "command")) }
+    if name == "memory_save" { return "[" + argString(b, "category") + "] " + argString(b, "title") }
+    if name == "memory_forget" { return argString(b, "slug") }
+    if name == "memory_recall" { return (argString(b, "category") + " " + argString(b, "query")).trim() }
+    if name == "grep" and argString(b, "pattern") != "" {
+        let place = argString(b, "path")
+        return argString(b, "pattern") + (if place != "" { "  in " + shortPath(place) } else { "" })
+    }
+    for key in ["path", "file_path", "pattern", "query", "url"] {
+        let v = argString(b, key)
+        if v != "" { return shortPath(v) }
+    }
+    if b.args.isNull() {
+        // still streaming: the path as soon as it's complete
+        for f in partialJsonFields(b.text) {
+            if (f.key == "path" or f.key == "file_path" or f.key == "command" or f.key == "pattern") and f.value != "" { return shortPath(firstLine(f.value)) }
+        }
+        return ""
+    }
+    return truncate(jsonEncode(b.args), 120)
+}
+
+fn codePanel(content: El) -> El {
+    return box(st().fill(C_CODE_BG).round(8).padXY(12, 8).clipped(), [content])
+}
+
+fn diffView(oldText: str, newText: str, limit: int, language: str) -> (El, int) {
+    var rows: [El] = []
+    var count = 0
+    var hidden = 0
+    for line in oldText.split("\n") {
+        if count < limit { rows.push(box(st().row().fill(C_DIFF_DEL).padXY(10, 0), [label("−  " + line, F_MONO_SMALL, C_DIFF_DEL_TEXT)])) } else { hidden += 1 }
+        count += 1
+    }
+    for line in newText.split("\n") {
+        if count < limit {
+            // added lines in the file's colours, behind a + marker
+            var spans: [Span] = [Span{text: "+  ", font: F_MONO_SMALL, color: C_DIFF_ADD_TEXT}]
+            for sp in highlight(line, language, F_MONO_SMALL) { spans.push(sp) }
+            rows.push(box(st().row().fill(C_DIFF_ADD).padXY(10, 0), [rich(st(), spans)]))
+        } else { hidden += 1 }
+        count += 1
+    }
+    return (box(st().round(8).clipped().padXY(0, 6).fill(C_CODE_BG), rows), hidden)
+}
+
+fn toolBody(b: Block, expanded: bool) -> [El] {
+    var body: [El] = []
+    let name = b.toolName
+    if name == "edit" {
+        var edits = b.args.at("edits").list()
+        if edits.len() == 0 and b.args.has("oldText") { edits = [b.args] }
+        var hidden = 0
+        for e in edits {
+            let (view, more) = diffView(e.at("oldText").asStr(), e.at("newText").asStr(), if expanded { 100000 } else { 12 }, languageOfPath(argString(b, "path")))
+            body.push(view)
+            hidden += more
+        }
+        if hidden > 0 { body.push(label("… {hidden} more diff lines — click the header to expand", F_SMALL, C_FAINT)) }
+    } else if name == "write" {
+        let path = argString(b, "path")
+        let (shown, more) = headLines(argString(b, "content"), if expanded { 600 } else { 14 })
+        body.push(codePanel(rich(st(), highlight(shown, languageOfPath(path), F_MONO_SMALL))))
+        if more > 0 { body.push(label("… {more} more lines", F_SMALL, C_FAINT)) }
+    } else if name == "bash" {
+        let commandText = argString(b, "command")
+        if commandText.contains("\n") or (expanded and commandText.len() > 80) {
+            body.push(codePanel(rich(st(), highlight(commandText, "bash", F_MONO_SMALL))))
+        }
+    }
+    let output = stripAnsi(b.output).trim()
+    let showOutput = expanded or b.status == 1 or b.status == 3
+    if output != "" and showOutput and name != "edit" {
+        let limit = if expanded { 600 } else { 8 }
+        let (shown, more) = if b.status == 1 { tailLines(output, limit) } else { headLines(output, limit) }
+        if more > 0 and b.status == 1 { body.push(label("… {more} earlier lines", F_SMALL, C_FAINT)) }
+        var content = label(shown, F_MONO_SMALL, C_TEXT_SOFT)
+        if b.status == 3 { content = label(shown, F_MONO_SMALL, C_BAD) }
+        else if name == "read" { content = rich(st(), highlight(shown, languageOfPath(argString(b, "path")), F_MONO_SMALL)) }
+        body.push(codePanel(content))
+        if more > 0 and b.status != 1 { body.push(label("… {more} more lines", F_SMALL, C_FAINT)) }
+    }
+    return body
+}
+
+fn toolView(b: Block) -> El {
+    let expanded = b.expanded or S.expandTools
+    var statusEl = iconSmall(I_CIRCLE, C_FAINT)
+    if b.status == 1 { statusEl = spinner(15, C_ACCENT_HI) }
+    else if b.status == 2 { statusEl = iconSmall(I_CHECK, C_GOOD) }
+    else if b.status == 3 { statusEl = iconSmall(I_TIMES, C_BAD) }
+    let accent = if b.status == 3 { C_BAD } else if b.status == 1 { C_ACCENT_HI } else { C_MUTED }
+    let timer = runtimeLabel(b.startedAt, b.endedAt, b.status == 1)
+    let header = clickable(st().row().alignTo(CENTER).gapOf(10).padXY(10, 8).round(9).hover(0xffffff08), [
+        box(st().w(26).h(26).round(7).fill(0xffffff0d).alignTo(CENTER).justifyTo(CENTER), [iconSmall(toolIcon(b.toolName), accent)]),
+        label(if b.toolName == "" { "tool" } else { b.toolName }, F_MONO_BOLD, C_TEXT),
+        box(st().flex(1), [label(truncate(toolSummary(b), max(min((chatWidth() - 320) / 8, 160), 10)), F_MONO_SMALL, C_MUTED)]),
+        timer,
+        statusEl,
+        iconSmall(if expanded { I_DOWN } else { I_RIGHT }, C_FAINT)
+    ], fn() { b.expanded = not b.expanded })
+    var children: [El] = [header]
+    let body = toolBody(b, expanded)
+    if body.len() > 0 { children.push(box(st().padTo(12, 0, 12, 12).gapOf(6), body)) }
+    return box(st().fill(C_PANEL).round(12).outline(if b.status == 1 { C_ACCENT_SOFT } else { 0xffffff0f }, 1), children)
+}
+
+fn assistantView(m: Msg) -> El {
+    var parts: [El] = []
+    var textParts: [str] = []
+    var hasTools = false
+    for i, b in m.blocks {
+        let streamingHere = m.streaming and i == m.blocks.len() - 1
+        if b.kind == BlockKind.Text {
+            if b.text.trim() == "" { continue }
+            textParts.push(b.text)
+            for el in markdownView(b.text, fn(t: str) { copyAndTell(t) }) { parts.push(el) }
+        } else if b.kind == BlockKind.Thinking {
+            if not S.showThinking { continue }
+            if b.text.trim() == "" and not streamingHere { continue }
+            parts.push(thinkingView(b, streamingHere))
+        } else {
+            hasTools = true
+            parts.push(toolView(b))
+        }
+    }
+    if m.error != "" {
+        let stopped = m.error == "Stopped."
+        let color = if stopped { C_FAINT } else { C_BAD }
+        parts.push(box(st().row().alignTo(CENTER).gapOf(10).padXY(12, 9).round(9).fill(if stopped { 0 } else { C_BAD_BG }).outline(color, 1), [
+            icon(if stopped { I_STOP } else { I_WARN }, color),
+            box(st().flex(1), [label(m.error, F_UI, color)])
+        ]))
+    }
+    if not m.streaming and textParts.len() > 0 and not hasTools {
+        let all = textParts.join("\n\n")
+        parts.push(withHoverOnly(box(st().row().gapOf(2), [smallAction(I_COPY, "Copy", fn() { copyAndTell(all) })])))
+    }
+    return asHoverGroup(box(st().gapOf(12), parts))
+}
+
+// how long a tool or shell command has run: ticking while it runs, then final
+fn formatDuration(ms: int) -> str {
+    if ms < 60000 { return "{ms / 1000}.{(ms / 100) % 10}s" }
+    let secs = ms / 1000
+    let rest = secs % 60
+    if secs < 3600 { return "{secs / 60}m " + (if rest < 10 { "0" } else { "" }) + "{rest}s" }
+    let mins = (secs / 60) % 60
+    return "{secs / 3600}h " + (if mins < 10 { "0" } else { "" }) + "{mins}m"
+}
+
+fn runtimeLabel(startedAt: int, endedAt: int, running: bool) -> El {
+    if startedAt == 0 { return box(st(), []) }
+    let end = if endedAt > 0 { endedAt } else if running { nowMs() } else { startedAt }
+    if end == startedAt and not running { return box(st(), []) }
+    return box(st().row().alignTo(CENTER).gapOf(5).padXY(7, 2).round(6).fill(if running { C_ACCENT_DIM } else { 0 }), [
+        iconSmall(I_CLOCK, if running { C_ACCENT_HI } else { C_FAINT }),
+        label(formatDuration(end - startedAt), F_MONO_SMALL, if running { C_ACCENT_HI } else { C_FAINT })
+    ])
+}
+
+fn bashView(m: Msg) -> El {
+    let text = stripAnsi(m.text)
+    let newline = text.indexOf("\n")
+    let header = if newline < 0 { text } else { text.sub(0, newline) }
+    let output = if newline < 0 { "" } else { text.sub(newline + 1, text.len()).trim() }
+    let running = S.bashRunning and m.id == S.bashMsgId
+    var tail = smallAction(I_COPY, "Copy", fn() { copyAndTell(output) })
+    if running { tail = spinner(15, C_INFO) }
+    var children: [El] = [
+        box(st().row().alignTo(CENTER).gapOf(10).padXY(12, 8), [
+            icon(I_TERMINAL, C_INFO),
+            box(st().flex(1), [label(header, F_MONO_BOLD, C_TEXT)]),
+            runtimeLabel(m.startedAt, m.endedAt, running),
+            tail
+        ])
+    ]
+    if output != "" { children.push(box(st().padTo(12, 0, 12, 12), [codePanel(label(tailLines(output, 400).0, F_MONO_SMALL, C_TEXT_SOFT))])) }
+    return box(st().fill(C_PANEL).round(12).outline(C_INFO_SOFT, 1), children)
+}
+
+fn noteView(m: Msg) -> El {
+    if m.role == "error" {
+        return box(st().row().alignTo(CENTER).gapOf(10).padXY(12, 9).round(9).fill(C_BAD_BG).outline(C_BAD, 1), [
+            icon(I_WARN, C_BAD), box(st().flex(1), [label(m.text, F_UI, C_BAD)])
+        ])
+    }
+    if m.role == "bash" { return bashView(m) }
+    return box(st().row().alignTo(CENTER).gapOf(12), [
+        box(st().flex(1).h(1).fill(C_BORDER), []),
+        iconSmall(I_COMPRESS, C_FAINT),
+        label(m.text, F_SMALL, C_FAINT),
+        box(st().flex(1).h(1).fill(C_BORDER), [])
+    ])
+}
+
+fn welcomeCard(glyph: str, title: str, detail: str, onClick: fn()) -> El {
+    return clickable(st().flex(1).gapOf(6).padXY(16, 14).round(12).fill(C_PANEL).hover(C_PANEL_HI).outline(0xffffff0a, 1), [
+        icon(glyph, C_ACCENT_HI),
+        label(title, F_UI_BOLD, C_TEXT),
+        label(detail, F_SMALL, C_FAINT)
+    ], onClick)
+}
+
+fn hintPair(keys: str, action: str) -> El {
+    return box(st().row().alignTo(CENTER).gapOf(6), [kbd(keys), label(action, F_SMALL, C_FAINT)])
+}
+
+fn welcomeView() -> El {
+    var skills = 0
+    var prompts = 0
+    var extensions = 0
+    for c in S.commands {
+        let source = c.at("source").asStr()
+        if source == "skill" { skills += 1 } else if source == "prompt" { prompts += 1 } else { extensions += 1 }
+    }
+    var cards: [El] = [
+        welcomeCard(I_BOLT, "Commands", "Type / for commands, skills and templates", fn() {
+            S.composer = "/"
+            requestFocus("composer")
+        }),
+        welcomeCard(I_AT, "Files", "Type @ to reference a file in this folder", fn() {
+            S.composer = "@"
+            requestFocus("composer")
+        }),
+        welcomeCard(I_TERMINAL, "Shell", "Start with ! to run a command, !! to keep it private", fn() {
+            S.composer = "!"
+            requestFocus("composer")
+        })
+    ]
+    if S.sessions.len() > 0 {
+        let latest = S.sessions[0].path
+        cards.push(welcomeCard(I_HISTORY, "Resume", truncate(S.sessions[0].title, 60), fn() { openSession(latest) }))
+    }
+    return box(st().alignTo(CENTER).gapOf(10).padTo(0, 70, 0, 0), [
+        box(st().w(64).h(64).round(18).fill(C_ACCENT).alignTo(CENTER).justifyTo(CENTER).shadowed(16), [label("π", F_TITLE, C_ON_ACCENT)]),
+        gapBox(8),
+        label("What should pi work on?", F_TITLE, C_TEXT),
+        box(st().row().alignTo(CENTER).gapOf(8), [iconSmall(I_FOLDER, C_FAINT), label(shortPath(S.cwd), F_MONO, C_FAINT)]),
+        label("{skills} skills · {prompts} prompt templates · {extensions} extension commands", F_SMALL, C_FAINT),
+        gapBox(16),
+        box(st().row().gapOf(12).maxWidth(820), cards),
+        gapBox(10),
+        box(st().row().gapOf(16), [
+            hintPair("Enter", "send"), hintPair("Shift+Enter", "new line"), hintPair("Ctrl+K", "commands"), hintPair("F1", "all shortcuts")
+        ])
+    ])
+}
+
+fn chatView() -> El {
+    var items: [El] = []
+    if S.messages.len() == 0 and S.connected { items.push(welcomeView()) }
+    for m in S.messages {
+        var el = box(st(), [])
+        if m.role == "user" { el = userView(m) }
+        else if m.role == "assistant" { el = assistantView(m) }
+        else { el = noteView(m) }
+        items.push(presence("m{m.id}", ENTER_RISE, el))
+    }
+    if S.running {
+        let last = if S.messages.len() > 0 { S.messages[S.messages.len() - 1] } else { Msg{id: 0, role: ""} }
+        if not (last.role == "assistant" and last.streaming) {
+            items.push(presence("working", ENTER_FADE, box(st().row().gapOf(10).alignTo(CENTER).padTo(6, 0, 0, 0), [
+                spinner(16, C_ACCENT_HI),
+                label("pi is working", F_SMALL, C_MUTED)
+            ])))
+        }
+    }
+    if S.retryNote != "" {
+        items.push(box(st().row().alignTo(CENTER).gapOf(8), [iconSmall(I_REFRESH, C_WARN), label(S.retryNote, F_SMALL, C_WARN)]))
+    }
+    let chat = scroll("chat", st().flex(1).alignTo(CENTER), [
+        box(st().maxWidth(chatMax()).gapOf(22).padTo(if chatWidth() < 660 { 14 } else { 28 }, 22, if chatWidth() < 660 { 14 } else { 28 }, 30), items)
+    ], true)
+    chat.centerShort = true          // the welcome view centres while it fits
+    return chat
+}
+
+// ---- composer suggestions ----
+
+struct Suggestion { label: str, detail: str, glyph: str, replacement: str, run: bool }
+
+// the token around the caret: (start, end)
+fn tokenAtCaret(text: str, caret: int) -> (int, int) {
+    var start = max(min(caret, text.len()), 0)
+    while start > 0 and text.byte(start - 1) != 32 and text.byte(start - 1) != 10 { start -= 1 }
+    var end = max(min(caret, text.len()), 0)
+    while end < text.len() and text.byte(end) != 32 and text.byte(end) != 10 { end += 1 }
+    return (start, end)
+}
+
+fn commandGlyph(source: str) -> str {
+    if source == "skill" { return I_BOOK }
+    if source == "prompt" { return I_COMMENT }
+    if source == "extension" { return I_PUZZLE }
+    if source == "terminal" { return I_EXTERNAL }
+    return I_RIGHT
+}
+
+fn currentSuggestions() -> [Suggestion] {
+    var out: [Suggestion] = []
+    let text = S.composer
+    let caret = caretOf("composer")
+    if caret < 0 { return out }
+    let (start, end) = tokenAtCaret(text, caret)
+    let token = text.sub(start, end)
+    if token == S.suggestDismissed and token != "" { return out }
+    if start == 0 and token.startsWith("/") and not text.contains(" ") {
+        let query = token.sub(1, token.len())
+        var scored: [(int, CommandInfo)] = []
+        for c in allCommands() {
+            let score = fuzzyScore(query, c.name)
+            if score >= 0 { scored.push((score + (if c.name.startsWith(query) { 100000 } else { 0 }), c)) }
+        }
+        var picked: [bool] = []
+        for x in scored { picked.push(false) }
+        for k in 0..min(scored.len(), 8) {
+            var best = 0 - 1
+            for i, item in scored {
+                if not picked[i] and (best < 0 or item.0 > scored[best].0) { best = i }
+            }
+            picked[best] = true
+            let c = scored[best].1
+            out.push(Suggestion{label: "/" + c.name + (if c.args != "" { " " + c.args } else { "" }), detail: c.description, glyph: commandGlyph(c.source), replacement: "/" + c.name + " ", run: c.args == "" and c.source != "prompt" and c.source != "skill"})
+        }
+        return out
+    }
+    if token.startsWith("@") {
+        indexFiles(S.cwd, nowMs())
+        for path in searchFiles(token.sub(1, token.len()), 8) {
+            out.push(Suggestion{label: path, detail: "", glyph: if path.endsWith("/") { I_FOLDER } else { I_FILE }, replacement: "@" + path + (if path.endsWith("/") { "" } else { " " }), run: false})
+        }
+        return out
+    }
+    return out
+}
+
+fn applySuggestion(s: Suggestion, runIt: bool) {
+    let caret = caretOf("composer")
+    let (start, end) = tokenAtCaret(S.composer, caret)
+    if runIt and s.run and start == 0 {
+        S.composer = s.replacement.trim()
+        S.suggestIndex = 0
+        submitPrompt(false)
+        return
+    }
+    S.composer = S.composer.sub(0, start) + s.replacement + S.composer.sub(end, S.composer.len())
+    S.suggestIndex = 0
+    requestFocusAt("composer", start + s.replacement.len())
+}
+
+// Tab with no suggestion list: complete the path under the caret
+fn completePathAtCaret() -> bool {
+    let caret = caretOf("composer")
+    let (start, end) = tokenAtCaret(S.composer, caret)
+    var token = S.composer.sub(start, end)
+    var prefix = ""
+    if token.startsWith("@") {
+        prefix = "@"
+        token = token.sub(1, token.len())
+    }
+    if token == "" { return false }
+    let matches = completePath(token, S.cwd, S.home)
+    if matches.len() == 0 { return false }
+    var completion = commonPrefix(matches)
+    if matches.len() == 1 and not completion.endsWith("/") { completion = completion + " " }
+    if completion.len() <= token.len() {
+        if matches.len() > 1 { toast(truncate(matches.join("   "), 400), "info") }
+        return true
+    }
+    S.composer = S.composer.sub(0, start) + prefix + completion + S.composer.sub(end, S.composer.len())
+    requestFocusAt("composer", start + prefix.len() + completion.len())
+    return true
+}
+
+fn suggestionsView(items: [Suggestion]) -> El {
+    var rows: [El] = []
+    let selected = min(S.suggestIndex, items.len() - 1)
+    for i, item in items {
+        let chosen = item
+        rows.push(clickable(st().row().alignTo(CENTER).gapOf(10).padXY(10, 7).round(7).fill(if i == selected { C_ACCENT_DIM } else { 0 }).hover(C_PANEL_HI), [
+            box(st().w(18), [iconSmall(item.glyph, if i == selected { C_ACCENT_HI } else { C_FAINT })]),
+            label(item.label, F_MONO_SMALL, C_TEXT),
+            box(st().flex(1), [label(truncate(item.detail, 90), F_SMALL, C_FAINT)])
+        ], fn() { applySuggestion(chosen, true) }))
+    }
+    rows.push(box(st().row().gapOf(14).padTo(10, 4, 10, 2), [
+        label("↑↓ choose", F_SMALL, C_FAINT), label("Tab complete", F_SMALL, C_FAINT), label("Enter run", F_SMALL, C_FAINT), label("Esc dismiss", F_SMALL, C_FAINT)
+    ]))
+    return presence("suggest", ENTER_RISE, box(st().fill(C_PANEL).outline(C_BORDER, 1).round(12).pad(6).gapOf(1).shadowed(18), rows))
+}
+
+// ---- composer ----
+
+fn composerKey(key: int, mods: int) -> bool {
+    let alt = (mods & MOD_ALT) != 0
+    let shift = (mods & MOD_SHIFT) != 0
+    let ctrl = (mods & MOD_CTRL) != 0
+    let suggestions = currentSuggestions()
+    if suggestions.len() > 0 {
+        let pick = suggestions[min(S.suggestIndex, suggestions.len() - 1)]
+        if key == KEY_DOWN {
+            S.suggestIndex = (S.suggestIndex + 1) % suggestions.len()
+            invalidate()
+            return true
+        }
+        if key == KEY_UP {
+            S.suggestIndex = (S.suggestIndex + suggestions.len() - 1) % suggestions.len()
+            invalidate()
+            return true
+        }
+        if key == KEY_TAB and not shift {
+            applySuggestion(pick, false)
+            return true
+        }
+        if (key == KEY_RETURN or key == KEY_KP_ENTER) and not shift and not alt {
+            // a fully typed command with arguments runs as typed
+            if S.composer.trim() + " " == pick.replacement and not pick.run { submitPrompt(false) }
+            else { applySuggestion(pick, true) }
+            return true
+        }
+        if key == KEY_ESCAPE {
+            let (start, end) = tokenAtCaret(S.composer, caretOf("composer"))
+            S.suggestDismissed = S.composer.sub(start, end)
+            invalidate()
+            return true
+        }
+    }
+    if key == KEY_TAB and shift {
+        send(command("cycle_thinking_level"))
+        return true
+    }
+    if key == KEY_TAB and not ctrl {
+        let completed = completePathAtCaret()
+        return true                           // Tab never leaves the composer
+    }
+    if (key == KEY_RETURN or key == KEY_KP_ENTER) and alt {
+        submitPrompt(true)
+        return true
+    }
+    if key == KEY_UP and alt {
+        restoreQueue()
+        return true
+    }
+    if key == KEY_UP and S.composer == "" and S.history.len() > 0 {
+        S.historyIndex = if S.historyIndex < 0 { S.history.len() - 1 } else { max(S.historyIndex - 1, 0) }
+        S.composer = S.history[S.historyIndex]
+        requestFocus("composer")
+        return true
+    }
+    if key == KEY_DOWN and S.historyIndex >= 0 {
+        S.historyIndex += 1
+        if S.historyIndex >= S.history.len() {
+            S.historyIndex = 0 - 1
+            S.composer = ""
+        } else {
+            S.composer = S.history[S.historyIndex]
+        }
+        requestFocus("composer")
+        return true
+    }
+    if key == KEY_PAGEUP {
+        scrollBy("chat", 0 - 500)
+        return true
+    }
+    if key == KEY_PAGEDOWN {
+        scrollBy("chat", 500)
+        return true
+    }
+    return false
+}
+
+fn attachmentsView() -> El {
+    var chips: [El] = []
+    for i, image in S.images {
+        let index = i
+        chips.push(withTip(attachmentTile(image, fn() {
+            var kept: [Attachment] = []
+            for j, other in S.images {
+                if j != index { kept.push(other) }
+            }
+            S.images = kept
+        }), image.name + " · {image.data.len() * 3 / 4 / 1024} KB"))
+    }
+    return box(st().row().gapOf(8).padTo(16, 12, 16, 0), chips)
+}
+
+fn queued(kind: str, t: str) -> El {
+    return box(st().row().alignTo(CENTER).gapOf(10).padXY(12, 7).round(9).fill(C_PANEL), [
+        iconSmall(I_CLOCK, C_ACCENT),
+        label(kind, F_SMALL_BOLD, C_ACCENT),
+        box(st().flex(1), [label(truncate(t, 200), F_SMALL, C_MUTED)]),
+        label("Alt+↑ to edit", F_SMALL, C_FAINT)
+    ])
+}
+
+fn composerView() -> El {
+    var above: [El] = []
+    if not S.connected and S.exitNote != "" {
+        above.push(box(st().row().alignTo(CENTER).gapOf(12).padXY(14, 10).round(10).fill(C_BAD_BG).outline(C_BAD, 1), [
+            icon(I_WARN, C_BAD),
+            box(st().flex(1), [label(S.exitNote, F_SMALL, C_BAD)]),
+            ghostButton("Restart pi", fn() { restartPi(sessionArgs()) })
+        ]))
+    }
+    for q in S.steering { above.push(queued("steer", q)) }
+    for q in S.followUp { above.push(queued("follow-up", q)) }
+    for key in S.widgets.keys() { above.push(box(st().padXY(12, 6).round(8).fill(C_PANEL), [label(stripAnsi(S.widgets[key]), F_MONO_SMALL, C_MUTED)])) }
+    var statusParts: [str] = []
+    for key in S.statuses.keys() { statusParts.push(stripAnsi(S.statuses[key])) }
+    let bashMode = S.composer.startsWith("!")
+    var hintText = "Enter send · Shift+Enter new line · / commands · @ files"
+    if bashMode {
+        hintText = if S.composer.startsWith("!!") { "Shell command — output stays out of the model's context" } else { "Shell command — output is added to the conversation" }
+    } else if S.running { hintText = "Enter steers · Alt+Enter queues a follow-up · Esc stops" }
+    if statusParts.len() > 0 { hintText = statusParts.join(" · ") }
+    let placeholder = if S.running { "Steer pi, or queue a follow-up…" } else { "Ask pi to do something…" }
+    let editor = input("composer", st().padXY(16, 13).fontOf(if bashMode { F_MONO } else { F_UI }).fg(if bashMode { C_INFO } else { C_TEXT }).maxHeight(280).minHeight(48),
+        S.composer, placeholder, fn(t: str) {
+            S.composer = t
+            S.suggestIndex = 0
+        }, fn(t: str) { submitPrompt(false) })
+    editor.onKey = composerKey
+    var actions: [El] = [withTip(clickable(st().w(32).h(32).round(16).alignTo(CENTER).justifyTo(CENTER).hover(C_PANEL_HI), [inkIcon(I_CLIP, F_ICON, C_MUTED, 32)], fn() { pickFiles() }), "Attach images · or paste with Ctrl+V, or drag them in")]
+    if bashMode { actions.push(box(st().row().alignTo(CENTER).gapOf(6).padXY(8, 3).round(6).fill(C_INFO_BG), [iconSmall(I_TERMINAL, C_INFO), label("shell", F_SMALL_BOLD, C_INFO)])) }
+    let narrow = chatWidth() < 660
+    if not narrow { actions.push(box(st().flex(1), [label(hintText, F_SMALL, C_FAINT)])) } else { actions.push(spacer()) }
+    if S.running or S.bashRunning {
+        actions.push(withTip(clickable(st().w(34).h(34).round(17).alignTo(CENTER).justifyTo(CENTER).fill(C_PANEL_HI).hover(C_PANEL_TOP), [inkIcon(I_STOP, F_ICON_SMALL, C_TEXT, 34)], fn() { abortRun() }), "Stop · Esc"))
+    }
+    let empty = S.composer.trim() == "" and S.images.len() == 0
+    actions.push(withTip(clickable(st().w(34).h(34).round(17).alignTo(CENTER).justifyTo(CENTER).fill(if empty { C_PANEL_TOP } else { C_ACCENT }).hover(if empty { C_BORDER } else { C_ACCENT_HI }), [
+        inkIcon(I_ARROW_UP, F_ICON, if empty { C_FAINT } else { C_ON_ACCENT }, 34)
+    ], fn() { submitPrompt(false) }), if S.running { "Steer · Enter (Alt+Enter queues)" } else { "Send · Enter" }))
+    let border = if bashMode { C_INFO } else { thinkingColor(S.thinking) }
+    var cardParts: [El] = []
+    if S.images.len() > 0 { cardParts.push(attachmentsView()) }
+    cardParts.push(autofocus(editor))
+    let card = box(st().fill(C_PANEL).round(16).outline(if border == C_BORDER { C_BORDER } else { (border & 0xffffff00) | 0x99 }, 1).shadowed(14), [
+        box(st(), cardParts),
+        box(st().row().alignTo(CENTER).gapOf(8).padTo(16, 0, 8, 8), actions)
+    ])
+    above.push(card)
+    let side = if narrow { 12 } else { 28 }
+    return box(st().alignTo(CENTER).padTo(side, 2, side, 4), [box(st().maxWidth(chatMax()).gapOf(8), above)])
+}
+
+// ---- panels ----
+
+struct PanelItem { label: str, detail: str, glyph: str, hint: str, active: bool, action: fn() }
+
+fn paletteItems(out: [PanelItem]) {
+    for c in allCommands() {
+        let text = "/" + c.name
+        let fillOnly = c.args.startsWith("<") or c.source == "prompt" or c.source == "skill"
+        out.push(PanelItem{label: text, detail: c.description, glyph: commandGlyph(c.source), hint: c.args, active: false, action: fn() {
+            closePanel()
+            if fillOnly {
+                S.composer = text + " "
+                requestFocus("composer")
+            } else {
+                runCommandText(text)
+            }
+        }})
+    }
+    out.push(PanelItem{label: "Toggle sidebar", detail: "", glyph: I_BARS, hint: "Ctrl+B", active: false, action: fn() {
+        S.sidebar = not S.sidebar
+        closePanel()
+    }})
+    out.push(PanelItem{label: "Context window breakdown", detail: "What fills the context, largest items first", glyph: I_DATABASE, hint: "Ctrl+I", active: false, action: fn() {
+        closePanel()
+        toggleDock("context")
+    }})
+    out.push(PanelItem{label: "Live file view", detail: "Follow the file pi reads and edits, as it types", glyph: I_FILE_TEXT, hint: "Ctrl+E", active: false, action: fn() {
+        closePanel()
+        toggleDock("file")
+    }})
+    out.push(PanelItem{label: "Memory vault", detail: "What pi remembers about your preferences", glyph: I_BOOK, hint: "Ctrl+M", active: false, action: fn() {
+        closePanel()
+        toggleDock("memory")
+    }})
+    out.push(PanelItem{label: "Attach files…", detail: "Images go to the model; other files become @references", glyph: I_CLIP, hint: "Ctrl+V pastes", active: false, action: fn() {
+        closePanel()
+        pickFiles()
+    }})
+    out.push(PanelItem{label: "Bigger interface", detail: "", glyph: I_EXPAND, hint: "Ctrl+=", active: false, action: fn() { zoomBy(0.1) }})
+    out.push(PanelItem{label: "Smaller interface", detail: "", glyph: I_COMPRESS, hint: "Ctrl+−", active: false, action: fn() { zoomBy(0.0 - 0.1) }})
+    out.push(PanelItem{label: "Edit prompt in external editor", detail: "", glyph: I_EDIT, hint: "Ctrl+G", active: false, action: fn() {
+        closePanel()
+        openExternalEditor()
+    }})
+    out.push(PanelItem{label: if S.showThinking { "Hide thinking" } else { "Show thinking" }, detail: "", glyph: I_BULB, hint: "Ctrl+T", active: false, action: fn() {
+        S.showThinking = not S.showThinking
+        closePanel()
+    }})
+    out.push(PanelItem{label: if S.expandTools { "Collapse tool output" } else { "Expand tool output" }, detail: "", glyph: I_EXPAND, hint: "Ctrl+O", active: false, action: fn() {
+        S.expandTools = not S.expandTools
+        closePanel()
+    }})
+    out.push(PanelItem{label: "Open pi in a terminal", detail: "The full terminal UI on this session", glyph: I_TERMINAL, hint: "", active: false, action: fn() {
+        closePanel()
+        openTerminal("any command")
+    }})
+}
+
+fn panelItems() -> [PanelItem] {
+    var out: [PanelItem] = []
+    let kind = S.panel
+    if kind == "palette" { paletteItems(out) }
+    else if kind == "model" {
+        for m in S.models {
+            let provider = m.at("provider").asStr()
+            let id = m.at("id").asStr()
+            var name = m.at("name").asStr()
+            if name == "" { name = id }
+            let ctx = m.at("contextWindow").asInt()
+            out.push(PanelItem{label: name, detail: provider + "/" + id, glyph: I_CHIP, hint: (if isLocalProvider(provider) { "local · " } else { "" }) + (if ctx > 0 { compactNumber(ctx) + " ctx" } else { "" }),
+                active: provider == S.provider and id == S.modelId, action: fn() {
+                    closePanel()
+                    chooseModel(provider, id)
+                }})
+        }
+    } else if kind == "thinking" {
+        for level in S.levels {
+            let chosen = level
+            out.push(PanelItem{label: level, detail: "", glyph: I_BULB, hint: "", active: level == S.thinking, action: fn() {
+                closePanel()
+                chooseThinking(chosen)
+            }})
+        }
+    } else if kind == "resume" {
+        for info in S.sessions {
+            let path = info.path
+            out.push(PanelItem{label: truncate(info.title, 90), detail: "", glyph: I_HISTORY, hint: ago(info.epoch), active: path == S.sessionFile, action: fn() {
+                closePanel()
+                openSession(path)
+            }})
+        }
+    } else if kind == "fork" {
+        for f in S.forkMessages {
+            let id = f.at("entryId").asStr()
+            out.push(PanelItem{label: truncate(firstLine(f.at("text").asStr()), 110), detail: "", glyph: I_FORK, hint: "", active: false, action: fn() {
+                closePanel()
+                send(jobj(["type", "entryId"], [jstr("fork"), jstr(id)]))
+            }})
+        }
+    } else if kind == "tree" {
+        for root in S.tree { treeItems(root, 0, out) }
+    }
+    if S.panelQuery != "" and kind != "rename" {
+        var filtered: [PanelItem] = []
+        for item in out {
+            if fuzzyScore(S.panelQuery, item.label + " " + item.detail) >= 0 { filtered.push(item) }
+        }
+        return filtered
+    }
+    return out
+}
+
+fn treeItems(node: Json, depth: int, out: [PanelItem]) {
+    let entry = node.at("entry")
+    let id = entry.at("id").asStr()
+    if entry.at("type").asStr() == "message" {
+        let m = entry.at("message")
+        let role = m.at("role").asStr()
+        if role == "user" or role == "assistant" {
+            var text = contentText(m.at("content"))
+            if role == "assistant" and text.trim() == "" { text = "(tool calls)" }
+            let isUser = role == "user"
+            out.push(PanelItem{label: "    ".repeat(min(depth, 10)) + truncate(firstLine(text.trim()), 100), detail: "", glyph: if isUser { I_USER } else { I_COMMENT },
+                hint: if id == S.leafId { "current" } else if isUser { "fork" } else { "" }, active: id == S.leafId, action: fn() {
+                    if isUser {
+                        closePanel()
+                        send(jobj(["type", "entryId"], [jstr("fork"), jstr(id)]))
+                    }
+                }})
+        }
+    }
+    let children = node.at("children").list()
+    for child in children { treeItems(child, if children.len() > 1 { depth + 1 } else { depth }, out) }
+}
+
+fn panelKey(key: int, mods: int) -> bool {
+    let items = panelItems()
+    if key == KEY_ESCAPE {
+        closePanel()
+        return true
+    }
+    if key == KEY_DOWN and items.len() > 0 {
+        S.panelIndex = (S.panelIndex + 1) % items.len()
+        invalidate()
+        return true
+    }
+    if key == KEY_UP and items.len() > 0 {
+        S.panelIndex = (S.panelIndex + items.len() - 1) % items.len()
+        invalidate()
+        return true
+    }
+    if key == KEY_RETURN or key == KEY_KP_ENTER {
+        if S.panel == "rename" {
+            send(jobj(["type", "name"], [jstr("set_session_name"), jstr(S.panelQuery.trim())]))
+            closePanel()
+            return true
+        }
+        if items.len() > 0 {
+            let action = items[min(S.panelIndex, items.len() - 1)].action
+            action()
+        }
+        return true
+    }
+    return false
+}
+
+fn panelTitle() -> (str, str) {
+    let k = S.panel
+    if k == "palette" { return ("Commands", "Run a command, skill or template") }
+    if k == "model" { return ("Model", "Ctrl+P cycles models · Ctrl+L opens this list") }
+    if k == "thinking" { return ("Thinking level", "Shift+Tab cycles levels") }
+    if k == "resume" { return ("Resume a session", shortPath(S.cwd)) }
+    if k == "fork" { return ("Fork from a message", "Starts a new session from an earlier prompt") }
+    if k == "tree" { return ("Session tree", "Click one of your messages to fork from it") }
+    if k == "rename" { return ("Rename session", "Shown in the sidebar and session lists") }
+    return ("", "")
+}
+
+fn panelHeader(title: str, subtitle: str) -> El {
+    var titles: [El] = [label(title, F_H2, C_TEXT)]
+    if subtitle != "" { titles.push(label(subtitle, F_SMALL, C_FAINT)) }
+    return box(st().row().alignTo(CENTER).gapOf(10).padTo(14, 12, 14, 4), [box(st().flex(1).gapOf(2), titles), kbd("Esc")])
+}
+
+fn listPanel() -> El {
+    let (title, subtitle) = panelTitle()
+    let items = panelItems()
+    S.panelIndex = max(0, min(S.panelIndex, items.len() - 1))
+    var rows: [El] = []
+    for i, item in items {
+        let selected = i == S.panelIndex
+        var texts: [El] = [label(item.label, if item.active { F_UI_BOLD } else { F_UI }, C_TEXT)]
+        if item.detail != "" { texts.push(label(item.detail, F_SMALL, C_FAINT)) }
+        var tail = label(item.hint, F_SMALL, C_FAINT)
+        if item.active { tail = iconSmall(I_CHECK, C_ACCENT_HI) }
+        rows.push(clickable(st().row().alignTo(CENTER).gapOf(12).padXY(12, 9).round(9).fill(if selected { C_ACCENT_DIM } else { 0 }).hover(C_PANEL_HI), [
+            box(st().w(18), [iconSmall(item.glyph, if selected or item.active { C_ACCENT_HI } else { C_FAINT })]),
+            box(st().flex(1).gapOf(2), texts),
+            tail
+        ], item.action))
+    }
+    if items.len() == 0 { rows.push(box(st().padXY(12, 10), [label(if S.panel == "fork" or S.panel == "tree" { "Loading…" } else { "Nothing matches." }, F_SMALL, C_FAINT)])) }
+    let field = input("panel-input", st().padXY(4, 4).fontOf(F_UI).fg(C_TEXT), S.panelQuery, if S.panel == "rename" { "Session name" } else { "Type to filter…" },
+        fn(t: str) {
+            S.panelQuery = t
+            S.panelIndex = 0
+        }, fn(t: str) { })
+    field.onKey = panelKey
+    var body: [El] = [
+        panelHeader(title, subtitle),
+        box(st().row().alignTo(CENTER).gapOf(10).padXY(12, 8).round(10).fill(C_CODE_BG).outline(C_BORDER, 1), [iconSmall(if S.panel == "rename" { I_TAG } else { I_SEARCH }, C_FAINT), box(st().flex(1), [field])])
+    ]
+    if S.panel != "rename" { body.push(scroll("panel-list", st().maxHeight(430).gapOf(2).padXY(2, 2), rows, false)) }
+    if S.panel == "tree" {
+        body.push(box(st().row().padXY(8, 4), [
+            spacer(),
+            ghostButton("Navigate the tree in pi's terminal UI", fn() { openTerminal("/tree") })
+        ]))
+    }
+    return panelCard(640, body)
+}
+
+fn panelCard(width: int, body: [El]) -> El {
+    return box(st().at(0 - 1, 70, 0 - 1, 0 - 1).w(width).fill(C_PANEL).outline(C_BORDER, 1).round(16).padXY(8, 8).gapOf(8).shadowed(28), body)
+}
+
+fn infoRow(name: str, value: str) -> El {
+    return box(st().row().gapOf(12).padXY(14, 5), [box(st().w(140), [label(name, F_SMALL, C_FAINT)]), box(st().flex(1), [label(value, F_SMALL, C_TEXT)])])
+}
+
+fn sessionPanel() -> El {
+    let d = S.stats
+    let tokens = d.at("tokens")
+    var rows: [El] = [
+        panelHeader("Session", ""),
+        infoRow("Name", if S.sessionName == "" { "—" } else { S.sessionName }),
+        infoRow("File", if S.sessionFile == "" { "not saved" } else { shortPath(S.sessionFile) }),
+        infoRow("ID", d.at("sessionId").asStr()),
+        infoRow("Model", S.provider + "/" + S.modelId + "  ·  thinking " + S.thinking),
+        infoRow("Messages", "{d.at("userMessages").asInt()} user · {d.at("assistantMessages").asInt()} assistant · {d.at("toolCalls").asInt()} tool calls"),
+        infoRow("Tokens", "{compactNumber(tokens.at("input").asInt())} in · {compactNumber(tokens.at("output").asInt())} out · {compactNumber(tokens.at("cacheRead").asInt())} cache read · {compactNumber(tokens.at("cacheWrite").asInt())} cache write"),
+        infoRow("Cost", "$" + formatCost(d.at("cost").asNum()))
+    ]
+    let usage = d.at("contextUsage")
+    if usage.kind == JsonKind.Object {
+        let pct = usage.at("percent").asNum()
+        rows.push(infoRow("Context", "{compactNumber(usage.at("tokens").asInt())} of {compactNumber(usage.at("contextWindow").asInt())} ({(pct + 0.5) as int}%)"))
+    }
+    let file = S.sessionFile
+    rows.push(box(st().row().gapOf(8).padTo(14, 10, 14, 8), [
+        spacer(),
+        ghostButton("Copy path", fn() { copyAndTell(file) }),
+        ghostButton("Export HTML", fn() {
+            closePanel()
+            runCommandText("/export")
+        }),
+        ghostButton("Compact now", fn() {
+            closePanel()
+            runCommandText("/compact")
+        })
+    ]))
+    return panelCard(640, rows)
+}
+
+fn settingRow(title: str, detail: str, control: El) -> El {
+    return box(st().row().alignTo(CENTER).gapOf(12).padXY(14, 9), [
+        box(st().flex(1).gapOf(2), [label(title, F_UI, C_TEXT), label(detail, F_SMALL, C_FAINT)]),
+        control
+    ])
+}
+
+fn segmented(options: [str], current: str, onPick: fn(str)) -> El { return tabs(options, current, onPick) }
+
+fn zoomControl() -> El {
+    let pct = (uiZoom * 100.0 + 0.5) as int
+    return box(st().row().alignTo(CENTER).gapOf(2).pad(2).round(8).fill(C_PANEL_HI), [
+        clickable(st().padXY(10, 5).round(6).hover(C_PANEL), [label("−", F_UI_BOLD, C_TEXT)], fn() { zoomBy(0.0 - 0.1) }),
+        box(st().w(54).alignTo(CENTER), [label("{pct}%", F_SMALL_BOLD, C_TEXT)]),
+        clickable(st().padXY(10, 5).round(6).hover(C_PANEL), [label("+", F_UI_BOLD, C_TEXT)], fn() { zoomBy(0.1) }),
+        clickable(st().padXY(10, 5).round(6).fill(if uiZoomSet { 0 } else { C_ACCENT }).hover(if uiZoomSet { C_PANEL } else { C_ACCENT_HI }), [
+            label("Auto", F_SMALL, if uiZoomSet { C_MUTED } else { C_ON_ACCENT })
+        ], fn() { zoomBy(0.0) })
+    ])
+}
+
+fn settingsPanel() -> El {
+    return panelCard(620, [
+        panelHeader("Settings", "Applied to the running pi session"),
+        settingRow("Automatic compaction", "Summarize older history when the context is nearly full", toggle(S.autoCompaction, fn() {
+            S.autoCompaction = not S.autoCompaction
+            send(jobj(["type", "enabled"], [jstr("set_auto_compaction"), jbool(S.autoCompaction)]))
+        })),
+        settingRow("Automatic retry", "Retry on overloaded, rate-limit and server errors", toggle(S.autoRetry, fn() {
+            S.autoRetry = not S.autoRetry
+            send(jobj(["type", "enabled"], [jstr("set_auto_retry"), jbool(S.autoRetry)]))
+        })),
+        settingRow("Steering delivery", "How messages sent while pi works are delivered", segmented(["one-at-a-time", "all"], S.steeringMode, fn(mode: str) {
+            S.steeringMode = mode
+            send(jobj(["type", "mode"], [jstr("set_steering_mode"), jstr(mode)]))
+        })),
+        settingRow("Follow-up delivery", "How queued follow-ups are delivered", segmented(["one-at-a-time", "all"], S.followUpMode, fn(mode: str) {
+            S.followUpMode = mode
+            send(jobj(["type", "mode"], [jstr("set_follow_up_mode"), jstr(mode)]))
+        })),
+        settingRow("Interface size", if uiZoomSet { "Ctrl+= / Ctrl+− · saved for next time" } else { "Automatic for this display · Ctrl+= / Ctrl+−" }, zoomControl()),
+        settingRow("Conversation width", "How wide messages and the composer get", segmented(["Narrow", "Medium", "Wide", "Full"], chatWidthChoice, fn(v: str) {
+            chatWidthChoice = v
+            layoutUnsaved = true
+        })),
+        settingRow("Show thinking", "Ctrl+T", toggle(S.showThinking, fn() { S.showThinking = not S.showThinking })),
+        settingRow("Expand tool output", "Ctrl+O", toggle(S.expandTools, fn() { S.expandTools = not S.expandTools })),
+        box(st().row().gapOf(8).padTo(14, 8, 14, 8), [
+            spacer(),
+            ghostButton("All pi settings (terminal)", fn() { openTerminal("/settings") })
+        ])
+    ])
+}
+
+fn hotkeysPanel() -> El {
+    let pairs = [
+        ("Enter", "Send · run a / command"), ("Shift+Enter", "New line"), ("Alt+Enter", "Queue a follow-up while pi works"),
+        ("Esc", "Stop pi (queued messages return to the editor)"), ("Alt+↑", "Return queued messages to the editor"),
+        ("Ctrl+K", "Command palette"), ("/", "Commands, skills and templates"), ("@", "Reference a file"), ("Tab", "Complete a path"),
+        ("!cmd · !!cmd", "Run a shell command (!! keeps output private)"), ("Ctrl+V", "Paste text or an image"),
+        ("Ctrl+L", "Choose a model"), ("Ctrl+P", "Cycle models"), ("Shift+Tab", "Cycle thinking levels"),
+        ("Ctrl+T", "Show / hide thinking"), ("Ctrl+O", "Expand / collapse tool output"), ("Ctrl+X", "Copy the last response"),
+        ("Ctrl+G", "Edit the prompt in $EDITOR"), ("Ctrl+N", "New session"), ("Ctrl+R", "Resume a session"), ("Ctrl+B", "Toggle the sidebar"),
+        ("Ctrl+I", "Context window breakdown"), ("Ctrl+E", "Live view of the file pi is editing"), ("Ctrl+M", "Memory vault"),
+        ("Ctrl+= / Ctrl+−", "Bigger / smaller interface"), ("Ctrl+0", "Automatic interface size"),
+        ("↑ / ↓", "Prompt history (empty editor)"), ("PgUp / PgDn", "Scroll the conversation"), ("Ctrl+C", "Copy selected text"), ("F1", "This list")
+    ]
+    var rows: [El] = []
+    for pair in pairs {
+        rows.push(box(st().row().alignTo(CENTER).gapOf(14).padXY(14, 4), [box(st().w(150), [kbd(pair.0)]), label(pair.1, F_SMALL, C_MUTED)]))
+    }
+    return panelCard(600, [panelHeader("Keyboard shortcuts", "The same keys as pi's terminal UI"), scroll("hotkeys", st().maxHeight(600).padTo(0, 0, 0, 6), rows, false)])
+}
+
+fn confirmPanel(title: str, message: str, confirmText: str, onConfirm: fn()) -> El {
+    return panelCard(480, [
+        box(st().gapOf(8).padTo(16, 14, 16, 4), [label(title, F_H2, C_TEXT), label(message, F_UI, C_MUTED)]),
+        box(st().row().gapOf(8).padTo(14, 6, 14, 10), [spacer(), ghostButton("Cancel", fn() { closePanel() }), primaryButton(confirmText, onConfirm)])
+    ])
+}
+
+fn panelView() -> [El] {
+    var out: [El] = []
+    if S.panel == "" { return out }
+    out.push(exitFade(presence("backdrop", ENTER_FADE, clickable(st().at(0, 0, 0, 0).fill(0x0000007a), [], fn() {
+        if S.panel != "terminal" { closePanel() }
+    }))))
+    let k = S.panel
+    if k == "session" { out.push(sessionPanel()) }
+    else if k == "settings" { out.push(settingsPanel()) }
+    else if k == "hotkeys" { out.push(hotkeysPanel()) }
+    else if k == "delete" {
+        let path = S.panelArg
+        out.push(confirmPanel("Delete this session?", "The session file is removed from disk. This can't be undone.", "Delete", fn() {
+            let removed = deleteFile(path)
+            refreshSessions()
+            closePanel()
+            toast(if removed { "Session deleted" } else { "Could not delete the session" }, if removed { "info" } else { "error" })
+        }))
+    } else if k == "terminal" {
+        out.push(panelCard(520, [
+            box(st().gapOf(10).padTo(18, 16, 18, 6).alignTo(CENTER), [
+                label(I_TERMINAL, F_ICON_BIG, C_ACCENT_HI),
+                label("pi is open in a terminal", F_H2, C_TEXT),
+                label("Run " + S.panelArg + " there. When you close the terminal, this window picks the session up again.", F_UI, C_MUTED)
+            ]),
+            box(st().row().padTo(14, 8, 14, 12), [spacer(), ghostButton("Reconnect now", fn() {
+                if let p = S.terminalProc { procKill(p) }
+            })])
+        ]))
+    } else { out.push(listPanel()) }
+    let card = out[out.len() - 1]
+    out[out.len() - 1] = exitRise(presence("panel-" + k, ENTER_RISE, card))
+    return out
+}
+
+// ---- dialogs and toasts ----
+
+fn dialogView() -> [El] {
+    var out: [El] = []
+    if S.dialog.isNull() { return out }
+    let d = S.dialog
+    let method = d.at("method").asStr()
+    var body: [El] = [label(d.at("title").asStr(), F_H2, C_TEXT)]
+    if d.at("message").asStr() != "" { body.push(label(d.at("message").asStr(), F_UI, C_MUTED)) }
+    var buttons: [El] = [spacer(), ghostButton("Cancel", fn() { cancelDialog() })]
+    if method == "select" {
+        for option in stringList(d.at("options")) {
+            let chosen = option
+            body.push(clickable(st().row().alignTo(CENTER).gapOf(10).padXY(12, 10).round(9).fill(C_PANEL_HI).hover(C_ACCENT_DIM), [iconSmall(I_RIGHT, C_ACCENT), label(option, F_UI, C_TEXT)], fn() {
+                answerDialog(jobj(["value"], [jstr(chosen)]))
+                requestFocus("composer")
+            }))
+        }
+    } else if method == "confirm" {
+        buttons.push(primaryButton("Confirm", fn() {
+            answerDialog(jobj(["confirmed"], [jbool(true)]))
+            requestFocus("composer")
+        }))
+    } else {
+        let tall = method == "editor"
+        let field = input("dialog-input", st().padXY(12, 10).fill(C_CODE_BG).round(8).outline(C_BORDER, 1).fontOf(if tall { F_MONO } else { F_UI }).fg(C_TEXT).minHeight(if tall { 180 } else { 40 }).maxHeight(360),
+            S.dialogText, d.at("placeholder").asStr(), fn(t: str) { S.dialogText = t }, fn(t: str) { submitDialogText() })
+        if tall {
+            field.onKey = fn(key: int, mods: int) -> bool {
+                if key == KEY_RETURN and (mods & MOD_CTRL) != 0 {
+                    submitDialogText()
+                    return true
+                }
+                return false
+            }
+        }
+        body.push(field)
+        buttons.push(primaryButton("OK", fn() { submitDialogText() }))
+    }
+    body.push(box(st().row().gapOf(8).padTo(0, 6, 0, 0), buttons))
+    for el in modal("dialog", 520, body) { out.push(el) }
+    return out
+}
+
+fn submitDialogText() {
+    answerDialog(jobj(["value"], [jstr(S.dialogText)]))
+    requestFocus("composer")
+}
+
+fn cancelDialog() {
+    answerDialog(jobj(["cancelled"], [jbool(true)]))
+    requestFocus("composer")
+}
+
+fn toastView() -> [El] {
+    var out: [El] = []
+    if S.toasts.len() == 0 { return out }
+    var cards: [El] = []
+    for t in S.toasts {
+        let tone = if t.kind == "error" { TONE_BAD } else if t.kind == "warning" { TONE_WARN } else { TONE_ACCENT }
+        cards.push(exitRise(presence("toast{t.until}", ENTER_RISE, toastCard(tone, if t.kind == "info" { I_CHECK } else { I_WARN }, t.text, []))))
+    }
+    out.push(box(st().at(0 - 1, 0 - 1, 22, 120).w(400).gapOf(8), cards))
+    return out
+}
+
+// ---- root ----
+
+fn appView(ctx: Ctx) -> El {
+    var chatChildren: [El] = [chatView()]
+    // suggestions float just above the composer
+    let suggestions = currentSuggestions()
+    if suggestions.len() > 0 and S.panel == "" {
+        chatChildren.push(box(st().at(0 - 1, 0 - 1, 0 - 1, 6).w(min(chatMax(), chatWidth()) - 56), [suggestionsView(suggestions)]))
+    } else if not isAtBottom("chat") {
+        chatChildren.push(exitRise(presence("jump", ENTER_RISE, box(st().at(0 - 1, 0 - 1, 0 - 1, 14), [
+            clickable(st().row().alignTo(CENTER).gapOf(8).padXY(14, 8).round(18).fill(C_PANEL_HI).hover(C_PANEL_TOP).outline(C_BORDER, 1).shadowed(12), [
+                iconSmall(I_ARROW_DOWN, C_ACCENT_HI), label("Jump to latest", F_SMALL, C_TEXT)
+            ], fn() { scrollToEnd("chat") })
+        ]))))
+    }
+    var mainColumn: [El] = [
+        headerView(),
+        box(st().h(1).fill(0xffffff0d), []),
+        box(st().flex(1), chatChildren),
+        composerView(),
+        footerView()
+    ]
+    var columns: [El] = []
+    var handles: [El] = []
+    if sidebarShown() {
+        columns.push(sidebarView())
+        columns.push(box(st().w(1).fill(0xffffff0c), []))
+        handles.push(box(st().row().at(sidebarWidth - 3, 0, 0 - 1, 0).w(7), [splitter(true, fn(dx: int, dy: int) {
+            if dx == 0 and dy == 0 { layoutDragFrom = sidebarWidth }
+            sidebarWidth = max(min(layoutDragFrom + dx, 440), 200)
+            layoutUnsaved = true
+        })]))
+    }
+    columns.push(box(st().flex(1), mainColumn))
+    if S.dock != "" {
+        if dockOverlay() {
+            columns.push(exitFade(presence("dock-overlay", ENTER_FADE, box(st().at(0 - 1, 0, 0, 0).w(dockWidth()).fill(C_SIDEBAR).shadowed(18), [box(st().flex(1), [dockView()])]))))
+        } else {
+            columns.push(box(st().w(1).fill(0xffffff0c), []))
+            columns.push(dockView())
+            handles.push(box(st().row().at(0 - 1, 0, dockWidth() - 3, 0).w(7), [splitter(true, fn(dx: int, dy: int) {
+                if dx == 0 and dy == 0 { layoutDragFrom = dockWidth() }
+                dockPref = max(min(layoutDragFrom - dx, viewW * 3 / 5), 300)
+                layoutUnsaved = true
+            })]))
+        }
+    }
+    for el in handles { columns.push(el) }
+    for el in appsFrameView() { columns.push(el) }
+    for el in panelView() { columns.push(el) }
+    for el in dialogView() { columns.push(el) }
+    for el in toastView() { columns.push(el) }
+    return box(st().row().fill(C_BG), columns)
+}
+
+fn globalKey(key: int, mods: int) -> bool {
+    let ctrl = (mods & MOD_CTRL) != 0
+    let shift = (mods & MOD_SHIFT) != 0
+    if key == KEY_ESCAPE {
+        if not S.dialog.isNull() { cancelDialog() }
+        else if S.panel != "" and S.panel != "terminal" { closePanel() }
+        else { abortRun() }
+        return true
+    }
+    if key == KEY_F1 {
+        openPanel("hotkeys")
+        return true
+    }
+    if key == KEY_TAB and shift {
+        send(command("cycle_thinking_level"))
+        return true
+    }
+    if not ctrl { return false }
+    if key == 107 { openPanel("palette") }                          // k
+    else if key == 110 { newSession() }                             // n
+    else if key == 98 { S.sidebar = not S.sidebar }                 // b
+    else if key == 108 { openPanel("model") }                       // l
+    else if key == 112 { send(command("cycle_model")) }             // p
+    else if key == 116 { S.showThinking = not S.showThinking }      // t
+    else if key == 111 { S.expandTools = not S.expandTools }        // o
+    else if key == 120 { copyLastAssistant() }                      // x
+    else if key == 103 { openExternalEditor() }                     // g
+    else if key == 114 { openPanel("resume") }                      // r
+    else if key == 105 { toggleDock("context") }                    // i
+    else if key == 101 { toggleDock("file") }                       // e
+    else if key == 109 { toggleDock("memory") }                     // m
+    else if key == 61 or key == 43 { zoomBy(0.1) }                  // = / +
+    else if key == 45 { zoomBy(0.0 - 0.1) }                         // -
+    else if key == 48 { zoomBy(0.0) }                               // 0: back to automatic
+    else { return false }
+    return true
+}
+
+// drag and drop: images attach, other files become @references
+fn dropFile(path: str) {
+    let mime = imageMime(path)
+    if mime != "" and isFile(path) {
+        S.images.push(Attachment{name: baseName(path), mime: mime, data: base64(readFile(path))})
+        toast("Attached " + baseName(path), "info")
+        return
+    }
+    var reference = path
+    if path.startsWith(S.cwd + "/") { reference = path.sub(S.cwd.len() + 1, path.len()) }
+    S.composer = (if S.composer == "" or S.composer.endsWith(" ") { S.composer } else { S.composer + " " }) + "@" + reference + " "
+    requestFocus("composer")
+}
+
+// Ctrl+V with an image on the clipboard attaches it
+fn pasteImage() -> bool {
+    for mime in ["image/png", "image/jpeg"] {
+        let data = clipboardData(mime)
+        if data != "" {
+            S.images.push(Attachment{name: "pasted image {S.images.len() + 1}", mime: mime, data: base64(data)})
+            toast("Image attached", "info")
+            invalidate()
+            return true
+        }
+    }
+    return false
+}
+
+// ---- panel widths (dragged with the splitters, saved for next time) ----
+
+
+fn layoutFile() -> str { return envVar("HOME") + "/.config/pi-desk/layout" }
+
+fn loadLayout() {
+    let path = layoutFile()
+    if not isFile(path) { return }
+    let f = readFile(path).trim().split(" ")
+    if f.len() >= 2 {
+        sidebarWidth = max(min(f[0] as int, 440), 200)
+        dockPref = max(f[1] as int, 300)
+    }
+    if f.len() >= 3 { chatWidthChoice = f[2] }
+}
+
+fn saveLayoutIfDone() {
+    if not layoutUnsaved or mouseDown { return }
+    layoutUnsaved = false
+    syscall(83, cstr(envVar("HOME") + "/.config"), 493)          // mkdir 0755
+    syscall(83, cstr(envVar("HOME") + "/.config/pi-desk"), 493)
+    writeFile(layoutFile(), "{sidebarWidth} {dockPref} {chatWidthChoice}\n")
+}
+
+// ---- interface size ----
+
+fn zoomFile() -> str { return envVar("HOME") + "/.config/pi-desk/zoom" }
+
+fn loadZoom() {
+    let path = zoomFile()
+    if envVar("ZUI_SCALE") != "" or not isFile(path) { return }
+    let saved = readFile(path).trim()
+    if saved != "" { setZoom(saved as float) }
+}
+
+// step the zoom (0: back to the automatic size) and remember it
+fn zoomBy(step: float) {
+    let path = zoomFile()
+    if step == 0.0 {
+        uiZoomSet = false
+        uiZoom = 1.0
+        autoZoom()
+        applyScale()
+        if isFile(path) { syscall(87, cstr(path)) }                 // unlink
+    } else {
+        let tenths = ((uiZoom + step) * 10.0 + 0.5) as int
+        setZoom((tenths as float) / 10.0)
+        syscall(83, cstr(envVar("HOME") + "/.config"), 493)          // mkdir 0755
+        syscall(83, cstr(envVar("HOME") + "/.config/pi-desk"), 493)
+        writeFile(path, "{uiZoom}\n")
+    }
+    toast("Interface size {((uiZoom * 100.0 + 0.5) as int)}%", "info")
+}

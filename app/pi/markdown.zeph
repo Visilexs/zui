@@ -1,0 +1,295 @@
+// Markdown for assistant messages: block structure (paragraphs, headings,
+// fenced code, lists, quotes, rules, tables) and inline styling (**bold**,
+// *italic*, `code`, [links](url)). Tolerates the unclosed fences and markers of
+// a message that is still streaming.
+import "highlight.zeph"
+
+enum MdKind { Para, Heading, Code, Item, Quote, Rule, Table }
+
+struct MdBlock { kind: MdKind, text: str, level: int = 0, marker: str = "" }
+
+fn mdIsAlnum(b: int) -> bool { return (b >= 48 and b <= 57) or (b >= 65 and b <= 90) or (b >= 97 and b <= 122) }
+
+fn mdIndent(line: str) -> int {
+    var n = 0
+    for b in line {
+        if b == 32 { n += 1 } else if b == 9 { n += 4 } else { return n }
+    }
+    return n
+}
+
+// "- x", "* x", "+ x", "12. x", "3) x": (marker, rest) or none
+fn mdListMarker(trimmed: str) -> (str, str)? {
+    if trimmed.len() >= 2 {
+        let b = trimmed.byte(0)
+        if (b == 45 or b == 42 or b == 43) and trimmed.byte(1) == 32 { return ("•", trimmed.sub(2, trimmed.len())) }
+    }
+    var i = 0
+    while i < trimmed.len() and trimmed.byte(i) >= 48 and trimmed.byte(i) <= 57 { i += 1 }
+    if i > 0 and i < 10 and i + 1 < trimmed.len() and (trimmed.byte(i) == 46 or trimmed.byte(i) == 41) and trimmed.byte(i + 1) == 32 {
+        return (trimmed.sub(0, i + 1), trimmed.sub(i + 2, trimmed.len()))
+    }
+    return none
+}
+
+fn mdIsRule(trimmed: str) -> bool {
+    if trimmed.len() < 3 { return false }
+    let first = trimmed.byte(0)
+    if first != 45 and first != 42 and first != 95 { return false }
+    for b in trimmed {
+        if b != first and b != 32 { return false }
+    }
+    return true
+}
+
+fn mdParse(src: str) -> [MdBlock] {
+    var blocks: [MdBlock] = []
+    let lines = src.split("\n")
+    var i = 0
+    var para: [str] = []
+    while i < lines.len() {
+        let line = lines[i]
+        let trimmed = line.trim()
+        let indent = mdIndent(line)
+        // fenced code
+        if trimmed.startsWith("```") or trimmed.startsWith("~~~") {
+            if para.len() > 0 {
+                blocks.push(MdBlock{kind: MdKind.Para, text: para.join(" ")})
+                para = []
+            }
+            let fence = trimmed.sub(0, 3)
+            let language = trimmed.sub(3, trimmed.len()).trim()
+            var code: [str] = []
+            i += 1
+            while i < lines.len() and not lines[i].trim().startsWith(fence) {
+                code.push(lines[i])
+                i += 1
+            }
+            i += 1
+            blocks.push(MdBlock{kind: MdKind.Code, text: code.join("\n"), marker: language})
+            continue
+        }
+        if trimmed == "" {
+            if para.len() > 0 {
+                blocks.push(MdBlock{kind: MdKind.Para, text: para.join(" ")})
+                para = []
+            }
+            i += 1
+            continue
+        }
+        var level = 0
+        while level < trimmed.len() and level < 6 and trimmed.byte(level) == 35 { level += 1 }
+        let heading = level > 0 and level < trimmed.len() and trimmed.byte(level) == 32
+        let listMarker = mdListMarker(trimmed)
+        let isTable = trimmed.startsWith("|")
+        let isQuote = trimmed.startsWith(">")
+        let isRule = mdIsRule(trimmed) and para.len() == 0
+        if heading or listMarker.has() or isTable or isQuote or isRule {
+            if para.len() > 0 {
+                blocks.push(MdBlock{kind: MdKind.Para, text: para.join(" ")})
+                para = []
+            }
+        }
+        if heading {
+            blocks.push(MdBlock{kind: MdKind.Heading, text: trimmed.sub(level + 1, trimmed.len()).trim(), level: level})
+            i += 1
+            continue
+        }
+        if isRule {
+            blocks.push(MdBlock{kind: MdKind.Rule, text: ""})
+            i += 1
+            continue
+        }
+        if let item = listMarker {
+            var body: [str] = [item.1]
+            i += 1
+            // continuation lines: indented deeper, not themselves list items
+            while i < lines.len() {
+                let next = lines[i]
+                let nextTrimmed = next.trim()
+                if nextTrimmed == "" or mdIndent(next) <= indent or mdListMarker(nextTrimmed).has() or nextTrimmed.startsWith("```") { break }
+                body.push(nextTrimmed)
+                i += 1
+            }
+            blocks.push(MdBlock{kind: MdKind.Item, text: body.join(" "), level: indent / 2, marker: item.0})
+            continue
+        }
+        if isTable {
+            var rows: [str] = []
+            while i < lines.len() and lines[i].trim().startsWith("|") {
+                rows.push(lines[i].trim())
+                i += 1
+            }
+            blocks.push(MdBlock{kind: MdKind.Table, text: rows.join("\n")})
+            continue
+        }
+        if isQuote {
+            var quoted: [str] = []
+            while i < lines.len() and lines[i].trim().startsWith(">") {
+                let q = lines[i].trim()
+                quoted.push(q.sub(1, q.len()).trim())
+                i += 1
+            }
+            blocks.push(MdBlock{kind: MdKind.Quote, text: quoted.join(" ")})
+            continue
+        }
+        para.push(trimmed)
+        i += 1
+    }
+    if para.len() > 0 { blocks.push(MdBlock{kind: MdKind.Para, text: para.join(" ")}) }
+    return blocks
+}
+
+// ---- inline ----
+
+fn mdSpans(source: str, baseFont: int, color: int) -> [Span] {
+    var spans: [Span] = []
+    var bold = false
+    var italic = false
+    var buffer: [str] = []
+    var runStart = 0
+    var i = 0
+    let n = source.len()
+    // flush text before position i in the current style
+    fn style(isBold: bool, isItalic: bool, base: int) -> int {
+        if base != F_UI { return base }
+        if isBold { return F_UI_BOLD }
+        if isItalic { return F_UI_ITALIC }
+        return F_UI
+    }
+    while i < n {
+        let b = source.byte(i)
+        if b == 96 {                                     // `code`
+            let close = mdFind(source, "`", i + 1)
+            if close > i {
+                if i > runStart { spans.push(Span{text: source.sub(runStart, i), font: style(bold, italic, baseFont), color: color}) }
+                spans.push(Span{text: source.sub(i + 1, close), font: F_MONO, color: C_CODE_INLINE, bg: C_CODE_INLINE_BG})
+                i = close + 1
+                runStart = i
+                continue
+            }
+        }
+        if b == 42 and i + 1 < n and source.byte(i + 1) == 42 {          // **
+            if i > runStart { spans.push(Span{text: source.sub(runStart, i), font: style(bold, italic, baseFont), color: color}) }
+            bold = not bold
+            i += 2
+            runStart = i
+            continue
+        }
+        if (b == 42 or b == 95) and i + 1 < n {          // *italic* / _italic_
+            let before = if i > 0 { source.byte(i - 1) } else { 32 }
+            let after = source.byte(i + 1)
+            let opens = not italic and after != 32 and not mdIsAlnum(before)
+            let closes = italic and before != 32 and not mdIsAlnum(after)
+            if opens or closes {
+                if i > runStart { spans.push(Span{text: source.sub(runStart, i), font: style(bold, italic, baseFont), color: color}) }
+                italic = not italic
+                i += 1
+                runStart = i
+                continue
+            }
+        }
+        if b == 91 {                                     // [text](url)
+            let closeBracket = mdFind(source, "](", i + 1)
+            if closeBracket > i {
+                let closeParen = mdFind(source, ")", closeBracket + 2)
+                if closeParen > closeBracket and closeBracket - i < 200 {
+                    if i > runStart { spans.push(Span{text: source.sub(runStart, i), font: style(bold, italic, baseFont), color: color}) }
+                    spans.push(Span{text: source.sub(i + 1, closeBracket), font: style(bold, italic, baseFont), color: C_LINK})
+                    i = closeParen + 1
+                    runStart = i
+                    continue
+                }
+            }
+        }
+        i += 1
+    }
+    if n > runStart { spans.push(Span{text: source.sub(runStart, n), font: style(bold, italic, baseFont), color: color}) }
+    if spans.len() == 0 { spans.push(Span{text: "", font: baseFont, color: color}) }
+    return spans
+}
+
+fn mdFind(text: str, needle: str, from: int) -> int {
+    if from >= text.len() { return 0 - 1 }
+    let at = text.sub(from, text.len()).indexOf(needle)
+    if at < 0 { return 0 - 1 }
+    return from + at
+}
+
+// ---- views ----
+
+fn codeBlock(code: str, language: str, onCopy: fn(str)) -> El {
+    let header = box(st().row().alignTo(CENTER).gapOf(6).padTo(12, 6, 6, 0), [
+        iconSmall(I_CODE, C_FAINT),
+        label(if language != "" { language } else if looksLikeZephyr(code) { "zephyr" } else { "code" }, F_SMALL, C_FAINT),
+        spacer(),
+        clickable(st().row().alignTo(CENTER).gapOf(5).padXY(8, 3).hover(C_PANEL_HI).round(5), [iconSmall(I_COPY, C_MUTED), label("Copy", F_SMALL, C_MUTED)], fn() { onCopy(code) })
+    ])
+    return box(st().fill(C_CODE_BG).round(8).outline(C_BORDER, 1), [
+        header,
+        rich(st().padTo(12, 4, 12, 10), highlight(code, language, F_MONO))
+    ])
+}
+
+fn tableBlock(source: str) -> El {
+    var rows: [[str]] = []
+    var widths: [int] = []
+    for line in source.split("\n") {
+        var inner = line
+        if inner.startsWith("|") { inner = inner.sub(1, inner.len()) }
+        if inner.endsWith("|") { inner = inner.sub(0, inner.len() - 1) }
+        var cells: [str] = []
+        var separator = true
+        for cell in inner.split("|") {
+            let c = cell.trim()
+            for b in c {
+                if b != 45 and b != 58 { separator = false }
+            }
+            cells.push(c)
+        }
+        if separator { continue }
+        for j, c in cells {
+            if j >= widths.len() { widths.push(0) }
+            widths[j] = max(widths[j], textWidth(F_MONO, c))
+        }
+        rows.push(cells)
+    }
+    var lines: [El] = []
+    for r, cells in rows {
+        var rowEls: [El] = []
+        for j, c in cells {
+            rowEls.push(box(st().w(((widths[j] / uiScale) as int) + 18), [label(c, if r == 0 { F_MONO_BOLD } else { F_MONO }, if r == 0 { C_TEXT } else { C_TEXT_SOFT })]))
+        }
+        lines.push(box(st().row().padXY(10, 3).fill(if r == 0 { C_PANEL_HI } else { 0 }), rowEls))
+    }
+    return box(st().outline(C_BORDER, 1).round(6).pad(1).clipped(), lines)
+}
+
+fn markdownView(source: str, onCopy: fn(str)) -> [El] {
+    var out: [El] = []
+    for block in mdParse(source) {
+        match block.kind {
+            Para { out.push(rich(st(), mdSpans(block.text, F_UI, C_TEXT))) }
+            Heading {
+                let font = if block.level <= 1 { F_H1 } else if block.level == 2 { F_H2 } else { F_UI_BOLD }
+                out.push(rich(st().padTo(0, 4, 0, 0), mdSpans(block.text, font, C_HEADING)))
+            }
+            Code { out.push(codeBlock(block.text, block.marker, onCopy)) }
+            Item {
+                out.push(box(st().row().padTo(4 + 18 * block.level, 0, 0, 0).gapOf(8), [
+                    box(st().w(if block.marker == "•" { 10 } else { 22 }), [unselectable(label(block.marker, F_UI, C_ACCENT))]),
+                    box(st().flex(1), [rich(st(), mdSpans(block.text, F_UI, C_TEXT))])
+                ]))
+            }
+            Quote {
+                out.push(box(st().row().gapOf(10), [
+                    box(st().w(3).fill(C_ACCENT_DIM).round(2), []),
+                    box(st().flex(1), [rich(st(), mdSpans(block.text, F_UI_ITALIC, C_MUTED))])
+                ]))
+            }
+            Rule { out.push(box(st().h(1).fill(C_BORDER), [])) }
+            Table { out.push(tableBlock(block.text)) }
+        }
+    }
+    return out
+}

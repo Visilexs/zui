@@ -1,0 +1,141 @@
+// A tour of lib/kit.zeph: buttons, tooltips, tabs, switches, badges,
+// spinners, skeletons, alerts, menus, a resizable panel and motion
+// (staggered enters, exit transitions).
+//   ./build.sh examples/kit.zeph build/kit && build/kit
+import "../lib/kit.zeph"
+
+const GLYPH_COG = "\xef\x80\x93"
+const GLYPH_STAR = "\xef\x80\x85"
+const GLYPH_INFO = "\xef\x81\x9a"
+const GLYPH_TRASH = "\xef\x87\xb8"
+
+var panelW = 260
+var panelFrom = 0
+
+fn section(title: str, children: [El]) -> El {
+    var all: [El] = [kitLabel(title, kit.fontSmallBold, kit.faint)]
+    for c in children { all.push(c) }
+    return box(st().gapOf(10), all)
+}
+
+fn gallery(ctx: Ctx) -> El {
+    let on = ctx.useBool(true)
+    let view = ctx.useStr("Week")
+    let menuOpen = ctx.useBool(false)
+    let picked = ctx.useStr("Rename")
+    let shown = ctx.useInt(0)
+    let check1 = ctx.useBool(true)
+    let check2 = ctx.useBool(false)
+    let radioPick = ctx.useStr("medium")
+    let slide = ctx.useInt(40)
+    let sel = ctx.useStr("Medium")
+    let dlg = ctx.useBool(false)
+    let bye = ctx.useBool(true)
+    var menu: [El] = [button("Menu: " + picked.get(), BTN_OUTLINE, fn() { menuOpen.toggle() })]
+    if menuOpen.flag() {
+        menu.push(popover("menu", st().at(0, 40, 0 - 1, 0 - 1).w(220), [
+            menuItem(GLYPH_STAR, "Rename", "F2", picked.get() == "Rename", fn() {
+                picked.set("Rename")
+                menuOpen.setFlag(false)
+            }),
+            menuItem(GLYPH_COG, "Settings", "Ctrl+,", picked.get() == "Settings", fn() {
+                picked.set("Settings")
+                menuOpen.setFlag(false)
+            }),
+            separator(),
+            menuItem(GLYPH_TRASH, "Delete", "", false, fn() { menuOpen.setFlag(false) })
+        ]))
+    }
+    var cards: [El] = []
+    for i in 0..shown.get() {
+        cards.push(presence("card{i}", ENTER_RISE, card(st().padXY(14, 10), [kitLabel("Card {i + 1}", kit.font, kit.text)])))
+    }
+    let staged = stagger(60, cards)   // each new card enters 60ms after the previous
+    var byeCard: [El] = []
+    if bye.flag() { byeCard.push(exitRise(presence("bye", ENTER_RISE, card(st().padXY(14, 10), [kitLabel("Bye bye", kit.font, kit.text)])))) }
+    let main = box(st().flex(1).pad(24).gapOf(22), [
+        section("FORMS", [box(st().col().gapOf(12).maxWidth(460), [
+            box(st().row().gapOf(18).alignTo(CENTER).wrapRows(), [
+                checkbox("Compact layout", check1.flag(), fn() { check1.toggle() }),
+                checkbox("Notifications", check2.flag(), fn() { check2.toggle() })
+            ]),
+            radioRow(["low", "medium", "high"], radioPick.get(), fn(v: str) { radioPick.set(v) }),
+            box(st().row().alignTo(CENTER).gapOf(10).wrapRows(), [
+                slider(slide.get(), 0, 100, 260, fn(v: int) { slide.set(v) }),
+                kitLabel("{slide.get()}%", kit.fontSmallBold, kit.muted)
+            ]),
+            box(st().row().gapOf(10).alignTo(CENTER).wrapRows(), [
+                select("demo-select", ["Narrow", "Medium", "Wide", "Full"], sel.get(), fn(v: str) { sel.set(v) }),
+                button("Open dialog", BTN_SECONDARY, fn() { dlg.setFlag(true) })
+            ])
+        ])]),
+        section("BUTTONS", [box(st().row().gapOf(8).alignTo(CENTER).wrapRows(), [
+            button("Primary", BTN_PRIMARY, fn() { }),
+            button("Secondary", BTN_SECONDARY, fn() { }),
+            button("Outline", BTN_OUTLINE, fn() { }),
+            button("Ghost", BTN_GHOST, fn() { }),
+            button("Delete", BTN_DANGER, fn() { }),
+            iconBtn(GLYPH_COG, "Settings (hover me)", false, fn() { }),
+            iconBtn(GLYPH_STAR, "Active icon button", true, fn() { })
+        ])]),
+        section("CONTROLS", [box(st().row().gapOf(16).alignTo(CENTER).wrapRows(), [
+            switchToggle(on.flag(), fn() { on.toggle() }),
+            tabs(["Day", "Week", "Month"], view.get(), fn(v: str) { view.set(v) }),
+            box(st(), menu)
+        ])]),
+        section("DISPLAY", [box(st().row().gapOf(10).alignTo(CENTER).wrapRows(), [
+            badge("neutral", TONE_NEUTRAL), badge("accent", TONE_ACCENT), badge("good", TONE_GOOD), badge("warn", TONE_WARN), badge("bad", TONE_BAD),
+            kbdKeys("Ctrl+K"), avatar("Z", 28, kit.accent), dot(8, kit.good), spinner(18, kit.accentHi), progressBar(620, 120, kit.accent)
+        ])]),
+        section("LOADING", [box(st().gapOf(8), [skeleton(320, 14), skeleton(240, 14), skeleton(280, 14)])]),
+        alert(TONE_WARN, GLYPH_INFO, "Alerts take a tone, an icon and optional actions.", [button("Undo", BTN_GHOST, fn() { })]),
+        section("TOASTS", [box(st().col().gapOf(8).maxWidth(360), [
+            toastCard(TONE_ACCENT, GLYPH_STAR, "Copied the last response", []),
+            toastCard(TONE_BAD, GLYPH_TRASH, "Could not open an editor", [button("Retry", BTN_GHOST, fn() { })])
+        ])]),
+        section("MOTION", [
+            box(st().row().gapOf(8).wrapRows(), [button("Add a card", BTN_SECONDARY, fn() { shown.set(shown.get() + 1) }), button("Clear", BTN_GHOST, fn() { shown.set(0) })]),
+            box(st().row().gapOf(8).wrapRows(), staged),
+            box(st().row().gapOf(8).wrapRows(), [
+                button(if bye.flag() { "Bring back" } else { "Dismiss card" }, BTN_OUTLINE, fn() { bye.toggle() }),
+                box(st().row().gapOf(8), byeCard)
+            ])
+        ])
+    ])
+    let side = box(st().w(panelW).fill(kit.surface).pad(18).gapOf(8), [
+        kitLabel("Resizable panel", kit.fontBold, kit.text),
+        kitLabel("Drag the handle on its edge.", kit.fontSmall, kit.muted),
+        kitLabel("{panelW} px", kit.fontSmall, kit.faint)
+    ])
+    var cols: [El] = [
+        side,
+        splitter(true, fn(dx: int, dy: int) {
+            if dx == 0 and dy == 0 { panelFrom = panelW }
+            panelW = max(min(panelFrom + dx, 480), 160)
+            invalidate()
+        }),
+        main
+    ]
+    if dlg.flag() {
+        for el in modal("demo-modal", 420, [
+            kitLabel("A Radix-style dialog", kit.fontBold, kit.text),
+            kitLabel("The backdrop dims the window and the card rises in.", kit.fontSmall, kit.muted),
+            box(st().row().gapOf(8), [spacer(), button("Close", BTN_PRIMARY, fn() { dlg.setFlag(false) })])
+        ]) { cols.push(el) }
+    }
+    return box(st().row().fill(kit.bg), cols)
+}
+
+fn main() {
+    zuiRun(App{title: "zui kit", background: kit.bg, render: fn(ctx: Ctx) -> El { return component("gallery", gallery) }, setup: fn() {
+        let icons = "Symbols Nerd Font,MesloLGM Nerd Font,MesloLGS Nerd Font"
+        kit.font = fontOpen("sans-serif", sc(14))
+        kit.fontBold = fontOpen("sans-serif:bold", sc(14))
+        kit.fontSmall = fontOpen("sans-serif", sc(12))
+        kit.fontSmallBold = fontOpen("sans-serif:bold", sc(12))
+        kit.fontMono = fontOpen("monospace", sc(13))
+        kit.fontIcon = fontOpen(icons, sc(15))
+        kit.fontIconSmall = fontOpen(icons, sc(13))
+        tipFont = kit.fontSmall
+    }}, 1100, 640)
+}

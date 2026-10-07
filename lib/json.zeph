@@ -1,0 +1,372 @@
+// JSON values, a parser that reports errors instead of panicking (the RPC
+// stream is untrusted input), and an encoder for the commands we send.
+
+enum JsonKind { Null, Bool, Number, Text, Array, Object }
+
+struct Json {
+    kind: JsonKind
+    flag: bool = false
+    number: float = 0.0
+    text: str = ""
+    items: [Json] = []
+    keys: [str] = []
+    values: [Json] = []
+}
+
+fn jnull() -> Json { return Json{kind: JsonKind.Null} }
+fn jstr(t: str) -> Json { return Json{kind: JsonKind.Text, text: t} }
+fn jnum(n: float) -> Json { return Json{kind: JsonKind.Number, number: n} }
+fn jbool(b: bool) -> Json { return Json{kind: JsonKind.Bool, flag: b} }
+fn jarr(items: [Json]) -> Json { return Json{kind: JsonKind.Array, items: items} }
+fn jobj(keys: [str], values: [Json]) -> Json { return Json{kind: JsonKind.Object, keys: keys, values: values} }
+
+impl Json {
+    // member lookup; a Null value when absent or not an object
+    fn at(self, key: str) -> Json {
+        if self.kind == JsonKind.Object {
+            for i, k in self.keys {
+                if k == key { return self.values[i] }
+            }
+        }
+        return jnull()
+    }
+    fn has(self, key: str) -> bool {
+        if self.kind != JsonKind.Object { return false }
+        for k in self.keys {
+            if k == key { return true }
+        }
+        return false
+    }
+    fn asStr(self) -> str {
+        if self.kind == JsonKind.Text { return self.text }
+        return ""
+    }
+    fn asNum(self) -> float {
+        if self.kind == JsonKind.Number { return self.number }
+        return 0.0
+    }
+    fn asInt(self) -> int { return self.asNum() as int }
+    fn asBool(self) -> bool { return self.kind == JsonKind.Bool and self.flag }
+    fn isNull(self) -> bool { return self.kind == JsonKind.Null }
+    fn list(self) -> [Json] {
+        if self.kind == JsonKind.Array { return self.items }
+        var empty: [Json] = []
+        return empty
+    }
+    fn set(self, key: str, value: Json) -> Json {
+        for i, k in self.keys {
+            if k == key {
+                self.values[i] = value
+                return self
+            }
+        }
+        self.keys.push(key)
+        self.values.push(value)
+        return self
+    }
+}
+
+// ---- parsing ----
+
+struct JsonReader { src: str, pos: int = 0, failed: bool = false }
+
+fn parseJsonText(src: str) -> Json? {
+    let r = JsonReader{src: src}
+    let v = jsonValue(r, 0)
+    jsonSpace(r)
+    if r.failed or r.pos != src.len() { return none }
+    return v
+}
+
+fn jsonSpace(r: JsonReader) {
+    let n = r.src.len()
+    while r.pos < n {
+        let c = r.src.byte(r.pos)
+        if c != 32 and c != 9 and c != 10 and c != 13 { return }
+        r.pos += 1
+    }
+}
+
+fn jsonFail(r: JsonReader) -> Json {
+    r.failed = true
+    r.pos = r.src.len()
+    return jnull()
+}
+
+fn jsonLiteral(r: JsonReader, word: str) -> bool {
+    if r.pos + word.len() > r.src.len() { return false }
+    if r.src.sub(r.pos, r.pos + word.len()) != word { return false }
+    r.pos += word.len()
+    return true
+}
+
+fn jsonValue(r: JsonReader, depth: int) -> Json {
+    jsonSpace(r)
+    if r.pos >= r.src.len() or depth > 200 { return jsonFail(r) }
+    let c = r.src.byte(r.pos)
+    if c == 123 {
+        r.pos += 1
+        var keys: [str] = []
+        var values: [Json] = []
+        jsonSpace(r)
+        if r.pos < r.src.len() and r.src.byte(r.pos) == 125 {
+            r.pos += 1
+            return jobj(keys, values)
+        }
+        while not r.failed {
+            jsonSpace(r)
+            if r.pos >= r.src.len() or r.src.byte(r.pos) != 34 { return jsonFail(r) }
+            keys.push(jsonString(r))
+            jsonSpace(r)
+            if r.pos >= r.src.len() or r.src.byte(r.pos) != 58 { return jsonFail(r) }
+            r.pos += 1
+            values.push(jsonValue(r, depth + 1))
+            jsonSpace(r)
+            if r.pos >= r.src.len() { return jsonFail(r) }
+            let d = r.src.byte(r.pos)
+            r.pos += 1
+            if d == 125 { return jobj(keys, values) }
+            if d != 44 { return jsonFail(r) }
+        }
+        return jnull()
+    }
+    if c == 91 {
+        r.pos += 1
+        var items: [Json] = []
+        jsonSpace(r)
+        if r.pos < r.src.len() and r.src.byte(r.pos) == 93 {
+            r.pos += 1
+            return jarr(items)
+        }
+        while not r.failed {
+            items.push(jsonValue(r, depth + 1))
+            jsonSpace(r)
+            if r.pos >= r.src.len() { return jsonFail(r) }
+            let d = r.src.byte(r.pos)
+            r.pos += 1
+            if d == 93 { return jarr(items) }
+            if d != 44 { return jsonFail(r) }
+        }
+        return jnull()
+    }
+    if c == 34 { return jstr(jsonString(r)) }
+    if jsonLiteral(r, "true") { return jbool(true) }
+    if jsonLiteral(r, "false") { return jbool(false) }
+    if jsonLiteral(r, "null") { return jnull() }
+    let start = r.pos
+    while r.pos < r.src.len() {
+        let d = r.src.byte(r.pos)
+        if (d >= 48 and d <= 57) or d == 45 or d == 43 or d == 46 or d == 101 or d == 69 { r.pos += 1 } else { break }
+    }
+    if r.pos == start { return jsonFail(r) }
+    let parsed = parseNumberText(r.src.sub(start, r.pos))
+    if not parsed.has() { return jsonFail(r) }
+    return jnum(parsed.get())
+}
+
+fn parseNumberText(t: str) -> float? {
+    var i = 0
+    var negative = false
+    if i < t.len() and t.byte(i) == 45 {
+        negative = true
+        i += 1
+    }
+    var value = 0.0
+    var digits = 0
+    while i < t.len() and t.byte(i) >= 48 and t.byte(i) <= 57 {
+        value = value * 10.0 + (t.byte(i) - 48)
+        i += 1
+        digits += 1
+    }
+    if i < t.len() and t.byte(i) == 46 {
+        i += 1
+        var scale = 0.1
+        while i < t.len() and t.byte(i) >= 48 and t.byte(i) <= 57 {
+            value += (t.byte(i) - 48) * scale
+            scale = scale / 10.0
+            i += 1
+            digits += 1
+        }
+    }
+    if digits == 0 { return none }
+    if i < t.len() and (t.byte(i) == 101 or t.byte(i) == 69) {
+        i += 1
+        var expNegative = false
+        if i < t.len() and (t.byte(i) == 45 or t.byte(i) == 43) {
+            expNegative = t.byte(i) == 45
+            i += 1
+        }
+        var e = 0
+        while i < t.len() and t.byte(i) >= 48 and t.byte(i) <= 57 {
+            e = min(e * 10 + (t.byte(i) - 48), 400)
+            i += 1
+        }
+        for k in 0..e {
+            if expNegative { value = value / 10.0 } else { value = value * 10.0 }
+        }
+    }
+    if i != t.len() { return none }
+    return if negative { 0.0 - value } else { value }
+}
+
+fn jsonHex(r: JsonReader) -> int {
+    if r.pos + 4 > r.src.len() {
+        r.failed = true
+        return 0
+    }
+    var v = 0
+    for k in 0..4 {
+        let c = r.src.byte(r.pos + k)
+        var d = 0
+        if c >= 48 and c <= 57 { d = c - 48 }
+        else if c >= 97 and c <= 102 { d = c - 87 }
+        else if c >= 65 and c <= 70 { d = c - 55 }
+        else { r.failed = true }
+        v = v * 16 + d
+    }
+    r.pos += 4
+    return v
+}
+
+fn utf8Encode(cp: int) -> str {
+    if cp < 128 { return chr(cp) }
+    if cp < 2048 { return chr(192 | (cp >> 6)) + chr(128 | (cp & 63)) }
+    if cp < 65536 { return chr(224 | (cp >> 12)) + chr(128 | ((cp >> 6) & 63)) + chr(128 | (cp & 63)) }
+    return chr(240 | (cp >> 18)) + chr(128 | ((cp >> 12) & 63)) + chr(128 | ((cp >> 6) & 63)) + chr(128 | (cp & 63))
+}
+
+fn jsonString(r: JsonReader) -> str {
+    r.pos += 1                                   // the opening quote
+    var parts: [str] = []
+    var runStart = r.pos
+    let n = r.src.len()
+    while r.pos < n {
+        let c = r.src.byte(r.pos)
+        if c == 34 {
+            parts.push(r.src.sub(runStart, r.pos))
+            r.pos += 1
+            if parts.len() == 1 { return parts[0] }
+            return parts.join()
+        }
+        if c == 92 {
+            parts.push(r.src.sub(runStart, r.pos))
+            if r.pos + 1 >= n {
+                r.failed = true
+                return parts.join()
+            }
+            let e = r.src.byte(r.pos + 1)
+            r.pos += 2
+            if e == 110 { parts.push("\n") }
+            else if e == 116 { parts.push("\t") }
+            else if e == 114 { parts.push("\r") }
+            else if e == 98 { parts.push(chr(8)) }
+            else if e == 102 { parts.push(chr(12)) }
+            else if e == 117 {
+                var cp = jsonHex(r)
+                if r.failed { return parts.join() }
+                // a surrogate pair spells one codepoint above U+FFFF
+                if cp >= 55296 and cp < 56320 and r.pos + 6 <= n and r.src.byte(r.pos) == 92 and r.src.byte(r.pos + 1) == 117 {
+                    r.pos += 2
+                    let low = jsonHex(r)
+                    if low >= 56320 and low < 57344 { cp = 65536 + ((cp - 55296) << 10) + (low - 56320) }
+                    else { cp = 65533 }
+                } else if cp >= 55296 and cp < 57344 {
+                    cp = 65533
+                }
+                parts.push(utf8Encode(cp))
+            }
+            else { parts.push(chr(e)) }
+            runStart = r.pos
+        } else {
+            r.pos += 1
+        }
+    }
+    parts.push(r.src.sub(runStart, n))
+    r.failed = true
+    return parts.join()                          // unterminated: what arrived so far
+}
+
+// The string fields of JSON that is still streaming in, in order, with the
+// last value possibly cut short: tool-call arguments as the model writes them.
+struct PartialField { key: str, value: str, complete: bool }
+
+fn partialJsonFields(src: str) -> [PartialField] {
+    var out: [PartialField] = []
+    let r = JsonReader{src: src}
+    var key = ""
+    var expectValue = false
+    let n = src.len()
+    while r.pos < n {
+        let c = src.byte(r.pos)
+        if c == 34 {
+            let t = jsonString(r)
+            let done = not r.failed
+            r.failed = false
+            if expectValue {
+                out.push(PartialField{key: key, value: t, complete: done})
+                expectValue = false
+            } else {
+                jsonSpace(r)
+                if r.pos < n and src.byte(r.pos) == 58 {         // ':'
+                    key = t
+                    expectValue = true
+                    r.pos += 1
+                }
+            }
+            if not done { return out }
+        } else {
+            if c != 32 and c != 9 and c != 10 and c != 13 { expectValue = false }
+            r.pos += 1
+        }
+    }
+    return out
+}
+
+// ---- encoding ----
+
+fn jsonQuote(t: str) -> str {
+    var parts: [str] = ["\""]
+    var runStart = 0
+    for i in 0..t.len() {
+        let c = t.byte(i)
+        if c == 34 or c == 92 or c < 32 {
+            parts.push(t.sub(runStart, i))
+            if c == 34 { parts.push("\\\"") }
+            else if c == 92 { parts.push("\\\\") }
+            else if c == 10 { parts.push("\\n") }
+            else if c == 13 { parts.push("\\r") }
+            else if c == 9 { parts.push("\\t") }
+            else {
+                let hex = "0123456789abcdef"
+                parts.push("\\u00" + chr(hex.byte(c >> 4)) + chr(hex.byte(c & 15)))
+            }
+            runStart = i + 1
+        }
+    }
+    parts.push(t.sub(runStart, t.len()))
+    parts.push("\"")
+    return parts.join()
+}
+
+fn jsonEncode(v: Json) -> str {
+    match v.kind {
+        Null { return "null" }
+        Bool { return if v.flag { "true" } else { "false" } }
+        Number {
+            if v.number == ((v.number as int) * 1.0) { return "{v.number as int}" }
+            return "{v.number}"
+        }
+        Text { return jsonQuote(v.text) }
+        Array {
+            var parts: [str] = []
+            for item in v.items { parts.push(jsonEncode(item)) }
+            return "[" + parts.join(",") + "]"
+        }
+        Object {
+            var parts: [str] = []
+            for i, k in v.keys { parts.push(jsonQuote(k) + ":" + jsonEncode(v.values[i])) }
+            return "\{" + parts.join(",") + "\}"
+        }
+    }
+    return "null"
+}

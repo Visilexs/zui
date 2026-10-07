@@ -1,0 +1,2447 @@
+// zui: a small React-style UI library for Zephyr.
+//
+//   fn counter(ctx: Ctx) -> El {
+//       let count = ctx.useInt(0)
+//       return row([
+//           text("clicked {count.get()} times"),
+//           button("+1", fn() { count.set(count.get() + 1) }),
+//       ])
+//   }
+//   zuiRun("Counter", 480, 320, fn(ctx: Ctx) -> El { return component("app", counter) })
+//
+// A render function returns a tree of `El` elements. Elements are matched to
+// the previous render's retained instances (`Inst`) by key, or by tag and
+// position, the way React reconciles. State created with ctx.useInt/useStr/...
+// lives on the instance, so it survives re-renders; setting it schedules a
+// new render. Widgets (scroll views, text inputs) keep their internal state
+// on their instances too. Layout is a flexbox subset, measured in logical
+// pixels and scaled to the display.
+import "gfx.zeph"
+
+enum Tag { Box, Text, Scroll, Input, Comp }
+
+const ROW = 0
+const COLUMN = 1
+const START = 0
+const CENTER = 1
+const END = 2
+const STRETCH = 3
+const BETWEEN = 4
+
+struct Style {
+    dir: int = 1
+    gap: int = 0
+    padL: int = 0
+    padT: int = 0
+    padR: int = 0
+    padB: int = 0
+    width: int = 0 - 1
+    height: int = 0 - 1
+    minW: int = 0
+    maxW: int = 0 - 1
+    minH: int = 0
+    maxH: int = 0 - 1
+    grow: int = 0
+    align: int = 3
+    justify: int = 0
+    bg: int = 0
+    hoverBg: int = 0
+    pressBg: int = 0
+    radius: int = 0
+    border: int = 0
+    borderW: int = 1
+    font: int = 0
+    color: int = 0 - 1
+    cursor: int = 0 - 1
+    clip: bool = false
+    wrap: bool = false           // row: let children wrap to the next line (CSS flex-wrap)
+    // absolute: placed at (left, top) inside the parent's box (right/bottom
+    // anchor when left/top are negative), out of the flow, painted on top
+    shadow: int = 0              // soft drop shadow size (logical px)
+    absolute: bool = false
+    left: int = 0 - 1
+    top: int = 0 - 1
+    right: int = 0 - 1
+    bottom: int = 0 - 1
+}
+
+impl Style {
+    fn row(self) -> Style { self.dir = ROW
+        return self }
+    fn col(self) -> Style { self.dir = COLUMN
+        return self }
+    fn gapOf(self, v: int) -> Style { self.gap = v
+        return self }
+    fn pad(self, v: int) -> Style { self.padL = v
+        self.padT = v
+        self.padR = v
+        self.padB = v
+        return self }
+    fn padXY(self, x: int, y: int) -> Style { self.padL = x
+        self.padR = x
+        self.padT = y
+        self.padB = y
+        return self }
+    fn padTo(self, l: int, t: int, r: int, b: int) -> Style { self.padL = l
+        self.padT = t
+        self.padR = r
+        self.padB = b
+        return self }
+    fn w(self, v: int) -> Style { self.width = v
+        return self }
+    fn h(self, v: int) -> Style { self.height = v
+        return self }
+    fn minWidth(self, v: int) -> Style { self.minW = v
+        return self }
+    fn maxWidth(self, v: int) -> Style { self.maxW = v
+        return self }
+    fn minHeight(self, v: int) -> Style { self.minH = v
+        return self }
+    fn maxHeight(self, v: int) -> Style { self.maxH = v
+        return self }
+    fn flex(self, v: int) -> Style { self.grow = v
+        return self }
+    fn alignTo(self, v: int) -> Style { self.align = v
+        return self }
+    fn justifyTo(self, v: int) -> Style { self.justify = v
+        return self }
+    fn fill(self, c: int) -> Style { self.bg = c
+        return self }
+    fn hover(self, c: int) -> Style { self.hoverBg = c
+        return self }
+    fn press(self, c: int) -> Style { self.pressBg = c
+        return self }
+    fn round(self, r: int) -> Style { self.radius = r
+        return self }
+    fn outline(self, c: int, width: int) -> Style { self.border = c
+        self.borderW = width
+        return self }
+    fn fontOf(self, f: int) -> Style { self.font = f
+        return self }
+    fn fg(self, c: int) -> Style { self.color = c
+        return self }
+    fn pointer(self) -> Style { self.cursor = CURSOR_POINTER
+        return self }
+    fn clipped(self) -> Style { self.clip = true
+        return self }
+    // rows only: let children wrap to the next line when they don't fit
+    fn wrapRows(self) -> Style { self.wrap = true
+        return self }
+    fn shadowed(self, size: int) -> Style { self.shadow = size
+        return self }
+    // absolute placement; pass -1 for the sides that float
+    fn at(self, left: int, top: int, right: int, bottom: int) -> Style { self.absolute = true
+        self.left = left
+        self.top = top
+        self.right = right
+        self.bottom = bottom
+        return self }
+}
+
+fn st() -> Style { return Style{} }
+
+// a run of text sharing a font and colour; `bg` paints behind it (inline code)
+struct Span { text: str, font: int, color: int, bg: int = 0 }
+
+// lo: byte offset of the run's text in the element's concatenated spans
+struct Run { x: int, text: str, font: int, color: int, bg: int, width: int, lo: int }
+struct Line { runs: [Run], y: int, h: int }
+
+// a wrapped line of a plain string: bytes [lo, hi) at row `row`
+struct PlainLine { lo: int, hi: int }
+
+struct Inst {
+    id: int
+    tag: Tag
+    key: str
+    children: [Inst] = []
+    ints: [int] = []
+    strs: [str] = []
+    hookInt: int = 0
+    hookStr: int = 0
+    // widgets
+    scroll: int = 0
+    contentH: int = 0
+    atBottom: bool = true
+    cursor: int = 0
+    anchor: int = 0
+    preferredX: int = 0 - 1
+    plain: [PlainLine] = []
+    cacheSpans: [Span] = []
+    cacheWidth: int = 0 - 1
+    lines: [Line] = []
+    textH: int = 0
+    scrollTarget: int = 0 - 1
+    textIndex: int = 0 - 1
+    // motion
+    bornAt: int = 0              // first drawn (enter transitions)
+    hoverMix: float = 0.0        // 0..1 between bg and hoverBg
+    lastX: int = 0 - 1           // layout animation: the previous layout position
+    lastY: int = 0 - 1
+    offX: float = 0.0            // ... and the offset still being animated away
+    offY: float = 0.0
+    velX: float = 0.0            // spring velocity for the glide offset
+    velY: float = 0.0
+    inNext: bool = false         // reconciliation bookkeeping
+}
+
+struct El {
+    tag: Tag
+    key: str = ""
+    style: Style
+    spans: [Span] = []
+    children: [El] = []
+    clickable: bool = false
+    onClick: fn() = noAction
+    render: fn(Ctx) -> El = noRender
+    value: str = ""
+    placeholder: str = ""
+    onChange: fn(str) = noText
+    onSubmit: fn(str) = noText
+    onKey: fn(int, int) -> bool = noKey
+    onDrag: fn(int, int) = noDrag   // (0, 0) on press, then the logical offset from it
+    draggable: bool = false
+    autofocus: bool = false
+    stickBottom: bool = false
+    selectable: bool = true      // text: can be selected with the mouse
+    hoverGroup: bool = false     // hoverOnly descendants show while this is hovered
+    hoverOnly: bool = false
+    tip: str = ""                // tooltip shown after hovering a moment
+    enterDelay: int = 0          // ms before the enter transition starts (stagger)
+    exit: int = 0                // exit transition: EXIT_FADE, EXIT_RISE, EXIT_DROP
+    dyingAt: int = 0             // ms timestamp when this element started dying
+    centerShort: bool = false    // scroll view: centre short content vertically
+    enter: int = 0               // enter transition: ENTER_FADE, ENTER_RISE, ENTER_DROP
+    layoutAnim: bool = false     // glide to new layout positions instead of jumping
+    alpha: int = 255             // opacity of the element and its subtree
+    painted: bool = false        // custom drawing: paint(x, y, w, h) after the background
+    paint: fn(int, int, int, int) = noPaint
+    animated: bool = false       // keeps redrawing every frame (spinners)
+    portal: bool = false         // drawn above everything else, outside ancestors' clips
+    image: int = 0               // an image id (gfx imageLoadBMP) drawn to fill the box
+    x: int = 0
+    y: int = 0
+    w: int = 0
+    h: int = 0
+    inst: Inst? = none
+}
+
+fn noAction() { }
+fn noDrag(dx: int, dy: int) { }
+fn noText(t: str) { }
+fn noKey(key: int, mods: int) -> bool { return false }
+fn noPaste() -> bool { return false }
+fn noRender(ctx: Ctx) -> El { return box(st(), []) }
+fn noPaint(x: int, y: int, w: int, h: int) { }
+
+// ---- hooks ----
+
+struct Ctx { inst: Inst }
+struct IntState { inst: Inst, slot: int }
+struct StrState { inst: Inst, slot: int }
+
+var zuiDirty = true
+var zuiRedraw = true
+var zuiNextId = 1
+var pendingFocusPos = 0 - 1
+var zuiAnimating = false
+// exit transitions: removed subtrees kept alive until their exit animation ends
+var dyingEls: [El] = []
+// inst id -> latest El carrying an exit flag, so a removed subtree can be drawn fading out
+var lastEl: [int: El] = [:]
+var scrollOps: [str: int] = [:]          // scroll key -> target (-1: the end, -2-n: by n... see scrollBy)
+var scrollDeltas: [str: int] = [:]
+var scrollAtBottom: [str: bool] = [:]
+var textOrder: [El] = []
+var allText: [El] = []
+var textIndexOf: [int: int] = [:]        // inst id -> position in textOrder
+var selActive = false
+var selecting = false
+var selAId = 0
+var selAOff = 0
+var selBId = 0
+var selBOff = 0
+var selectionFill = 0xf9731640
+var hoverIds: [int] = []
+var hoverGroupShown = false
+var dropHandler: fn(str) = noText
+var pasteHandler: fn() -> bool = noPaste
+
+fn invalidate() { zuiDirty = true }
+
+impl IntState {
+    fn get(self) -> int { return self.inst.ints[self.slot] }
+    fn set(self, v: int) {
+        if self.inst.ints[self.slot] != v {
+            self.inst.ints[self.slot] = v
+            zuiDirty = true
+        }
+    }
+    fn flag(self) -> bool { return self.inst.ints[self.slot] != 0 }
+    fn setFlag(self, v: bool) { self.set(if v { 1 } else { 0 }) }
+    fn toggle(self) { self.setFlag(not self.flag()) }
+}
+impl StrState {
+    fn get(self) -> str { return self.inst.strs[self.slot] }
+    fn set(self, v: str) {
+        if self.inst.strs[self.slot] != v {
+            self.inst.strs[self.slot] = v
+            zuiDirty = true
+        }
+    }
+}
+
+impl Ctx {
+    fn useInt(self, initial: int) -> IntState {
+        let inst = self.inst
+        if inst.hookInt == inst.ints.len() { inst.ints.push(initial) }
+        inst.hookInt += 1
+        return IntState{inst: inst, slot: inst.hookInt - 1}
+    }
+    fn useBool(self, initial: bool) -> IntState { return self.useInt(if initial { 1 } else { 0 }) }
+    fn useStr(self, initial: str) -> StrState {
+        let inst = self.inst
+        if inst.hookStr == inst.strs.len() { inst.strs.push(initial) }
+        inst.hookStr += 1
+        return StrState{inst: inst, slot: inst.hookStr - 1}
+    }
+}
+
+// ---- element constructors ----
+
+fn box(style: Style, children: [El]) -> El { return El{tag: Tag.Box, style: style, children: children} }
+fn row(children: [El]) -> El { return El{tag: Tag.Box, style: st().row(), children: children} }
+fn col(children: [El]) -> El { return El{tag: Tag.Box, style: st(), children: children} }
+fn spacer() -> El { return El{tag: Tag.Box, style: st().flex(1)} }
+fn gapBox(size: int) -> El { return El{tag: Tag.Box, style: st().w(size).h(size)} }
+
+fn textStyled(style: Style, content: str) -> El {
+    return El{tag: Tag.Text, style: style, spans: [Span{text: content, font: style.font, color: style.color}]}
+}
+fn text(content: str) -> El { return textStyled(st(), content) }
+fn rich(style: Style, spans: [Span]) -> El { return El{tag: Tag.Text, style: style, spans: spans} }
+
+fn clickable(style: Style, children: [El], onClick: fn()) -> El {
+    if style.cursor < 0 { style.cursor = CURSOR_POINTER }
+    return El{tag: Tag.Box, style: style, children: children, clickable: true, onClick: onClick}
+}
+
+// a box that reports mouse drags that start on it
+fn draggable(style: Style, children: [El], onDrag: fn(int, int)) -> El {
+    return El{tag: Tag.Box, style: style, children: children, clickable: true, draggable: true, onDrag: onDrag}
+}
+
+fn scroll(key: str, style: Style, children: [El], stickBottom: bool) -> El {
+    style.clip = true
+    return El{tag: Tag.Scroll, key: key, style: style, children: children, stickBottom: stickBottom}
+}
+
+fn input(key: str, style: Style, value: str, placeholder: str, onChange: fn(str), onSubmit: fn(str)) -> El {
+    if style.cursor < 0 { style.cursor = CURSOR_TEXT }
+    return El{tag: Tag.Input, key: key, style: style, value: value, placeholder: placeholder, onChange: onChange, onSubmit: onSubmit}
+}
+
+fn component(key: str, render: fn(Ctx) -> El) -> El {
+    return El{tag: Tag.Comp, key: key, style: st(), render: render}
+}
+
+fn withKey(el: El, key: str) -> El {
+    el.key = key
+    return el
+}
+
+// ---- motion (CSS transitions / framer-motion, scaled down) ----
+//
+// Hover backgrounds always cross-fade. An element can also fade in when it
+// first appears (`presence`, like AnimatePresence's `initial`), glide to a new
+// layout position with spring physics (`glide`, like framer-motion's `layout`
+// prop), fade out when it leaves the tree (`exitFade`/`exitRise`/`exitDrop`,
+// like AnimatePresence's exit transitions), be staggered (`stagger`), be drawn
+// translucent (`faded`), or paint itself every frame (`canvas`).
+
+const ENTER_FADE = 1
+const ENTER_RISE = 2             // fade in while moving up a few pixels
+const ENTER_DROP = 3             // fade in while moving down (menus, popovers)
+const EXIT_FADE = 1              // exit transitions: play when the element leaves the tree
+const EXIT_RISE = 2              // ... while drifting up as it fades
+const EXIT_DROP = 3              // ... while sinking down as it fades
+const ENTER_MS = 170.0
+const EXIT_MS = 170.0
+const SPRING_K = 180.0           // glide spring stiffness (1/s^2)
+const SPRING_C = 20.0            // glide spring damping (1/s); underdamped -> slight overshoot
+const HOVER_MS = 110.0
+
+// key an element and give it an enter transition; the key keeps it the same
+// instance across renders, so it animates once
+fn presence(key: str, enter: int, el: El) -> El {
+    el.key = key
+    el.enter = enter
+    return el
+}
+// AnimatePresence-style exit: when this keyed element leaves the tree it keeps
+// being drawn while its exit transition plays, then is removed
+fn exitFade(el: El) -> El {
+    el.exit = EXIT_FADE
+    return el
+}
+fn exitRise(el: El) -> El {
+    el.exit = EXIT_RISE
+    return el
+}
+fn exitDrop(el: El) -> El {
+    el.exit = EXIT_DROP
+    return el
+}
+// delay each child's enter transition by i*ms (Motion stagger)
+fn stagger(ms: int, els: [El]) -> [El] {
+    for i, el in els { if el.enter != 0 { el.enterDelay = i * ms } }
+    return els
+}
+fn glide(el: El) -> El {
+    el.layoutAnim = true
+    return el
+}
+fn faded(el: El, alpha: int) -> El {
+    el.alpha = alpha
+    return el
+}
+// lift an element (a menu, a popover) into the top layer, like React's
+// createPortal: it lays out where it is but draws over everything and gets
+// the pointer first
+fn portal(el: El) -> El {
+    el.portal = true
+    return el
+}
+
+fn withTip(el: El, tip: str) -> El {
+    el.tip = tip
+    return el
+}
+
+// a box whose content is drawn by `paint` (in device pixels); `animated`
+// redraws it every frame while it's on screen
+fn canvas(style: Style, animated: bool, paint: fn(int, int, int, int)) -> El {
+    return El{tag: Tag.Box, style: style, painted: true, paint: paint, animated: animated}
+}
+
+// a picture filling the box, cropped to keep its aspect (an outline in the
+// style draws over its edge)
+fn imageView(style: Style, id: int) -> El {
+    return El{tag: Tag.Box, style: style, image: id}
+}
+
+// blend two 0xRRGGBBAA colours; a fully transparent end takes the other's hue
+fn mixColor(a: int, b: int, t: float) -> int {
+    if t <= 0.0 { return a }
+    if t >= 1.0 { return b }
+    var from = a
+    var to = b
+    if (from & 255) == 0 { from = to & 0xffffff00 }
+    if (to & 255) == 0 { to = from & 0xffffff00 }
+    var out = 0
+    for shift in [24, 16, 8, 0] {
+        let x = (from >> shift) & 255
+        let y = (to >> shift) & 255
+        out = out | ((((x + (y - x) * t) + 0.5) as int) << shift)
+    }
+    return out
+}
+
+fn easeOut(t: float) -> float {
+    let u = 1.0 - min(max(t, 0.0), 1.0)
+    return 1.0 - u * u * u
+}
+
+// ---- reconciliation ----
+
+fn newInst(el: El) -> Inst {
+    zuiNextId += 1
+    return Inst{id: zuiNextId, tag: el.tag, key: el.key}
+}
+
+fn reconcile(el: El, old: Inst?) -> Inst {
+    var inst = newInst(el)
+    if let previous = old {
+        if previous.tag == el.tag and previous.key == el.key { inst = previous }
+    }
+    el.inst = inst
+    if el.exit != 0 { lastEl[inst.id] = el }
+    if el.tag == Tag.Comp {
+        inst.hookInt = 0
+        inst.hookStr = 0
+        let renderFn = el.render
+        let child = renderFn(Ctx{inst: inst})
+        el.children = [child]
+    }
+    // match children: keyed ones by key, the rest by position among unkeyed
+    var keyed: [str: Inst] = [:]
+    var unkeyed: [Inst] = []
+    for c in inst.children {
+        if c.key != "" { keyed[c.key] = c } else { unkeyed.push(c) }
+    }
+    var next: [Inst] = []
+    var position = 0
+    for child in el.children {
+        var found: Inst? = none
+        if child.key != "" {
+            found = keyed.get(child.key)
+        } else {
+            if position < unkeyed.len() { found = unkeyed[position] }
+            position += 1
+        }
+        if let f = found { f.inNext = true }
+        next.push(reconcile(child, found))
+    }
+    // AnimatePresence: old keyed children that fell out of the tree keep being
+    // drawn while their exit transition plays
+    for c in inst.children {
+        if c.key != "" and not c.inNext {
+            if let cel = lastEl.get(c.id) { pushDying(cel) }
+        }
+    }
+    for c in next { c.inNext = false }
+    inst.children = next
+    return inst
+}
+
+// ---- text wrapping ----
+
+fn isSpace(b: int) -> bool { return b == 32 or b == 9 }
+
+// break a plain string into lines no wider than `width`
+fn wrapPlain(fontId: int, content: str, width: int) -> [PlainLine] {
+    var lines: [PlainLine] = []
+    var lineStart = 0
+    var lineW = 0
+    var lastBreak = 0 - 1          // byte after the last space on this line
+    var widthAtBreak = 0
+    var i = 0
+    let n = content.len()
+    while i < n {
+        let b = content.byte(i)
+        if b == 10 {
+            lines.push(PlainLine{lo: lineStart, hi: i})
+            i += 1
+            lineStart = i
+            lineW = 0
+            lastBreak = 0 - 1
+            continue
+        }
+        let (cp, len) = utf8At(content, i)
+        let adv = charAdvance(fontId, cp)
+        if lineW + adv > width and i > lineStart and not isSpace(b) {
+            if lastBreak > lineStart {
+                lines.push(PlainLine{lo: lineStart, hi: lastBreak})
+                lineStart = lastBreak
+                lineW = lineW - widthAtBreak
+            } else {
+                lines.push(PlainLine{lo: lineStart, hi: i})
+                lineStart = i
+                lineW = 0
+            }
+            lastBreak = 0 - 1
+        }
+        lineW += adv
+        i += len
+        if isSpace(b) {
+            lastBreak = i
+            widthAtBreak = lineW
+        }
+    }
+    lines.push(PlainLine{lo: lineStart, hi: n})
+    return lines
+}
+
+// lay out styled spans into lines of runs
+fn wrapSpans(spans: [Span], width: int, defaultFont: int) -> [Line] {
+    var lines: [Line] = []
+    var runs: [Run] = []
+    var x = 0
+    var lineH = fontLineHeight(defaultFont)
+    var y = 0
+    var base = 0
+    for span in spans {
+        let content = span.text
+        let n = content.len()
+        var i = 0
+        let lh = fontLineHeight(span.font)
+        while i < n {
+            let b = content.byte(i)
+            if b == 10 {
+                if lh > lineH { lineH = lh }
+                lines.push(Line{runs: runs, y: y, h: lineH})
+                y += lineH
+                runs = []
+                x = 0
+                lineH = fontLineHeight(defaultFont)
+                i += 1
+                continue
+            }
+            // one token: a run of spaces or of non-spaces
+            var j = i
+            let spaceToken = isSpace(b)
+            while j < n and content.byte(j) != 10 and isSpace(content.byte(j)) == spaceToken { j += 1 }
+            var tokenW = textWidthRange(span.font, content, i, j)
+            if spaceToken and x == 0 and runs.len() > 0 {
+                i = j                      // swallow spaces at a wrapped line's start
+                continue
+            }
+            if x + tokenW > width and x > 0 {
+                if spaceToken {
+                    i = j
+                    continue
+                }
+                if lh > lineH { lineH = lh }
+                lines.push(Line{runs: runs, y: y, h: lineH})
+                y += lineH
+                runs = []
+                x = 0
+                lineH = fontLineHeight(defaultFont)
+            }
+            // a token wider than the whole line: break it by characters
+            while tokenW > width and j - i > 1 {
+                var k = i
+                var w = 0
+                while k < j {
+                    let (cp, len) = utf8At(content, k)
+                    let adv = charAdvance(span.font, cp)
+                    if w + adv > width - x and k > i { break }
+                    w += adv
+                    k += len
+                }
+                runs.push(Run{x: x, text: content.sub(i, k), font: span.font, color: span.color, bg: span.bg, width: w, lo: base + i})
+                if lh > lineH { lineH = lh }
+                lines.push(Line{runs: runs, y: y, h: lineH})
+                y += lineH
+                runs = []
+                x = 0
+                lineH = fontLineHeight(defaultFont)
+                i = k
+                tokenW = textWidthRange(span.font, content, i, j)
+            }
+            if lh > lineH { lineH = lh }
+            // extend the previous run when it is the same span and adjacent
+            if runs.len() > 0 and runs[runs.len() - 1].font == span.font and runs[runs.len() - 1].color == span.color and runs[runs.len() - 1].bg == span.bg and runs[runs.len() - 1].x + runs[runs.len() - 1].width == x and runs[runs.len() - 1].lo + runs[runs.len() - 1].text.len() == base + i {
+                let last = runs[runs.len() - 1]
+                last.text = last.text + content.sub(i, j)
+                last.width += tokenW
+            } else {
+                runs.push(Run{x: x, text: content.sub(i, j), font: span.font, color: span.color, bg: span.bg, width: tokenW, lo: base + i})
+            }
+            x += tokenW
+            i = j
+        }
+        base += n
+    }
+    lines.push(Line{runs: runs, y: y, h: lineH})
+    return lines
+}
+
+fn textLines(el: El, width: int) -> [Line] {
+    let inst = el.inst.get()
+    if inst.cacheWidth == width and inst.cacheSpans == el.spans { return inst.lines }
+    inst.lines = wrapSpans(el.spans, width, el.style.font)
+    inst.cacheSpans = el.spans
+    inst.cacheWidth = width
+    var h = 0
+    for line in inst.lines { h = line.y + line.h }
+    inst.textH = h
+    return inst.lines
+}
+
+// ---- layout ----
+
+// uiScale = pixelScale (the display's pixel density) × uiZoom (the user's
+// size preference); layout and fonts are in device pixels at uiScale
+var zuiWindow = 0
+var uiScale = 1.0
+var pixelScale = 1.0
+var uiZoom = 1.0
+var uiZoomSet = false               // the app or ZUI_SCALE picked a zoom
+var uiFontScale = 1.0               // the scale the open fonts were rasterized at
+
+fn applyScale() {
+    let next = pixelScale * uiZoom
+    if next == uiScale and next == uiFontScale { return }
+    uiScale = next
+    if gfxFonts.len() > 0 and uiFontScale != next {
+        fontsRescale(next / uiFontScale)
+    }
+    uiFontScale = next
+    zuiDirty = true
+}
+
+// change the zoom while running (Ctrl+= / Ctrl+-, a settings control)
+fn setZoom(z: float) {
+    uiZoom = max(min(z, 3.0), 0.5)
+    uiZoomSet = true
+    applyScale()
+}
+
+// big screens at scale 1 (a 4K monitor without compositor scaling) get a
+// larger default, picked from the display's height
+fn autoZoom() {
+    if uiZoomSet or zuiWindow == 0 { return }
+    let display = SDL_GetDisplayForWindow(zuiWindow)
+    if display == 0 { return }
+    let mode = SDL_GetCurrentDisplayMode(display)
+    if mode == 0 { return }
+    let height = load32(mode + 12)             // SDL_DisplayMode.h
+    var z = 1.0
+    // when the compositor already scales (pixel density > 1) leave it alone
+    if pixelScale < 1.25 {
+        if height >= 2800 { z = 2.0 } else if height >= 2000 { z = 1.5 } else if height >= 1600 { z = 1.25 }
+    }
+    if z != uiZoom {
+        uiZoom = z
+        applyScale()
+    }
+}
+fn sc(v: int) -> int {
+    if v < 0 { return v }
+    return (v * uiScale + 0.5) as int
+}
+
+fn hPad(s: Style) -> int { return sc(s.padL) + sc(s.padR) }
+fn vPad(s: Style) -> int { return sc(s.padT) + sc(s.padB) }
+
+fn clampW(s: Style, w: int) -> int {
+    var r = w
+    if s.maxW >= 0 and r > sc(s.maxW) { r = sc(s.maxW) }
+    if r < sc(s.minW) { r = sc(s.minW) }
+    return r
+}
+fn clampH(s: Style, h: int) -> int {
+    var r = h
+    if s.maxH >= 0 and r > sc(s.maxH) { r = sc(s.maxH) }
+    if r < sc(s.minH) { r = sc(s.minH) }
+    return r
+}
+
+// preferred width, at most `limit`
+fn measureW(el: El, limit: int) -> int {
+    let s = el.style
+    if s.width >= 0 { return min(sc(s.width), limit) }
+    var w = 0
+    if el.tag == Tag.Comp {
+        w = measureW(el.children[0], limit)
+    } else if el.tag == Tag.Text {
+        var lineW = 0
+        for span in el.spans {
+            var start = 0
+            let content = span.text
+            for i in 0..content.len() + 1 {
+                if i == content.len() or content.byte(i) == 10 {
+                    lineW += textWidthRange(span.font, content, start, i)
+                    if i < content.len() {
+                        if lineW > w { w = lineW }
+                        lineW = 0
+                    }
+                    start = i + 1
+                }
+            }
+        }
+        if lineW > w { w = lineW }
+        w += hPad(s) + 1
+    } else if el.tag == Tag.Input or el.tag == Tag.Scroll {
+        w = limit
+    } else {
+        let inner = limit - hPad(s)
+        if s.dir == ROW {
+            var counted = 0
+            for child in el.children {
+                if child.style.absolute { continue }
+                if counted > 0 { w += sc(s.gap) }
+                w += measureW(child, max(inner - w, 0))
+                counted += 1
+            }
+        } else {
+            for child in el.children {
+                if not child.style.absolute { w = max(w, measureW(child, inner)) }
+            }
+        }
+        w += hPad(s)
+    }
+    let r = min(clampW(s, w), limit)
+    // minW is a hard floor: a tight cascade must not shrink it below
+    if r < sc(s.minW) { return sc(s.minW) }
+    return r
+}
+
+// position el at (x, y) with width w; h < 0 means "as tall as the content".
+// Returns the height used.
+fn layout(el: El, x: int, y: int, w: int, h: int) -> int {
+    let s = el.style
+    el.x = x
+    el.y = y
+    el.w = w
+    if el.tag == Tag.Comp {
+        el.h = layout(el.children[0], x, y, w, h)
+        return el.h
+    }
+    let innerW = max(w - hPad(s), 0)
+    let innerX = x + sc(s.padL)
+    let innerY = y + sc(s.padT)
+    var contentH = 0
+    if el.tag == Tag.Text {
+        let lines = textLines(el, innerW)
+        contentH = el.inst.get().textH
+    } else if el.tag == Tag.Input {
+        let inst = el.inst.get()
+        // the value may have changed under the caret (cleared, replaced)
+        inst.cursor = max(0, min(inst.cursor, el.value.len()))
+        inst.anchor = max(0, min(inst.anchor, el.value.len()))
+        inst.plain = wrapPlain(s.font, el.value, max(innerW - 2, 1))
+        contentH = inst.plain.len() * fontLineHeight(s.font)
+        // the input scrolls internally when its content outgrows maxH
+    } else if el.tag == Tag.Scroll {
+        let inst = el.inst.get()
+        var cy = 0
+        for i, child in el.children {
+            if i > 0 { cy += sc(s.gap) }
+            let cw = childWidth(child, s, innerW)
+            var cx = innerX
+            if s.align == CENTER { cx = innerX + (innerW - cw) / 2 }
+            if s.align == END { cx = innerX + innerW - cw }
+            cy += layout(child, cx, innerY + cy, cw, 0 - 1)
+        }
+        inst.contentH = cy
+        contentH = cy
+        // centre short content vertically in the viewport (welcome screens)
+        if el.centerShort and h >= 0 {
+            let off = max(h - vPad(s) - cy, 0) / 2
+            if off > 0 { for child in el.children { child.y += off } }
+        }
+    } else {
+        var flow: [El] = []
+        var floating = false
+        for child in el.children {
+            if child.style.absolute { floating = true } else { flow.push(child) }
+        }
+        let all = el.children
+        el.children = flow
+        if s.dir == COLUMN {
+            contentH = layoutColumn(el, innerX, innerY, innerW, if h >= 0 { max(h - vPad(s), 0) } else { 0 - 1 })
+        } else if s.wrap {
+            contentH = layoutWrapRow(el, innerX, innerY, innerW, if h >= 0 { max(h - vPad(s), 0) } else { 0 - 1 })
+        } else {
+            contentH = layoutRow(el, innerX, innerY, innerW, if h >= 0 { max(h - vPad(s), 0) } else { 0 - 1 })
+        }
+        el.children = all
+        if floating {
+            var total0 = contentH + vPad(s)
+            if s.height >= 0 { total0 = sc(s.height) }
+            if h >= 0 { total0 = h }
+            total0 = clampH(s, total0)
+            for child in all {
+                if child.style.absolute { layoutAbsolute(child, x, y, w, total0) }
+            }
+        }
+    }
+    var total = contentH + vPad(s)
+    if s.height >= 0 { total = sc(s.height) }
+    if h >= 0 { total = h }
+    total = clampH(s, total)
+    el.h = total
+    if el.tag == Tag.Scroll {
+        let inst = el.inst.get()
+        let viewport = total - vPad(s)
+        let maxScroll = max(inst.contentH - viewport, 0)
+        if el.key != "" and scrollOps.has(el.key) {
+            let op = scrollOps[el.key]
+            scrollOps.remove(el.key)
+            inst.scrollTarget = if op < 0 { maxScroll } else { op }
+        }
+        if el.key != "" and scrollDeltas.has(el.key) {
+            let base = if inst.scrollTarget >= 0 { inst.scrollTarget } else { inst.scroll }
+            inst.scrollTarget = max(0, min(base + scrollDeltas[el.key], maxScroll))
+            scrollDeltas.remove(el.key)
+        }
+        if el.stickBottom and inst.atBottom and inst.scrollTarget < 0 { inst.scroll = maxScroll }
+        if inst.scrollTarget >= 0 {
+            let target = max(0, min(inst.scrollTarget, maxScroll))
+            let diff = target - inst.scroll
+            if abs(diff) <= 1 {
+                inst.scroll = target
+                inst.scrollTarget = 0 - 1
+            } else {
+                var step = diff * 2 / 5
+                if step == 0 { step = if diff > 0 { 1 } else { 0 - 1 } }
+                inst.scroll += step
+                zuiAnimating = true
+            }
+        }
+        inst.scroll = max(0, min(inst.scroll, maxScroll))
+        let settled = if inst.scrollTarget >= 0 { max(0, min(inst.scrollTarget, maxScroll)) } else { inst.scroll }
+        inst.atBottom = settled >= maxScroll - 2
+        if el.key != "" { scrollAtBottom[el.key] = inst.atBottom or maxScroll == 0 }
+        if inst.scroll != 0 {
+            for child in el.children { shiftY(child, 0 - inst.scroll) }
+        }
+    }
+    return total
+}
+
+fn layoutAbsolute(el: El, px: int, py: int, pw: int, ph: int) {
+    let s = el.style
+    var w = 0
+    // an explicit width may overhang the parent (a menu under a small
+    // button), but not the window
+    if s.width >= 0 { w = min(sc(s.width), max(pw, gfxWidth)) }
+    else if s.left >= 0 and s.right >= 0 { w = min(pw - sc(s.left) - sc(s.right), pw) }
+    else { w = min(measureW(el, pw), pw) }
+    var fixedH = 0 - 1
+    if s.height >= 0 { fixedH = sc(s.height) }
+    else if s.top >= 0 and s.bottom >= 0 { fixedH = ph - sc(s.top) - sc(s.bottom) }
+    var x = px
+    if s.left >= 0 { x = px + sc(s.left) } else if s.right >= 0 { x = px + pw - sc(s.right) - w } else { x = px + (pw - w) / 2 }
+    // lay out at the top first to learn the height, then move into place
+    let h = layout(el, x, py, w, fixedH)
+    var y = py
+    if s.top >= 0 { y = py + sc(s.top) } else if s.bottom >= 0 { y = py + ph - sc(s.bottom) - h } else { y = py + (ph - h) / 2 }
+    if y != py { shiftY(el, y - py) }
+}
+
+// scroll a keyed scroll view: to the end, to a position, or by an amount
+fn scrollToEnd(key: str) {
+    scrollOps[key] = 0 - 1
+    zuiDirty = true
+}
+fn scrollTo(key: str, y: int) {
+    scrollOps[key] = max(y, 0)
+    zuiDirty = true
+}
+fn scrollBy(key: str, dy: int) {
+    scrollDeltas[key] = scrollDeltas.get(key).or(0) + dy
+    zuiDirty = true
+}
+fn isAtBottom(key: str) -> bool { return scrollAtBottom.get(key).or(true) }
+
+fn shiftY(el: El, dy: int) {
+    el.y += dy
+    for child in el.children { shiftY(child, dy) }
+}
+
+fn layoutColumn(el: El, x: int, y: int, w: int, h: int) -> int {
+    let s = el.style
+    let gap = sc(s.gap)
+    var heights: [int] = []
+    var fixedTotal = 0
+    var growTotal = 0
+    // pass 1: content heights of the non-growing children
+    for i, child in el.children {
+        if i > 0 { fixedTotal += gap }
+        let cw = childWidth(child, s, w)
+        if child.style.grow > 0 and h >= 0 {
+            growTotal += child.style.grow
+            heights.push(0)
+        } else {
+            let ch = layout(child, x, y, cw, 0 - 1)
+            heights.push(ch)
+            fixedTotal += ch
+        }
+    }
+    let free = if h >= 0 { max(h - fixedTotal, 0) } else { 0 }
+    var cy = y
+    if growTotal == 0 and h >= 0 {
+        if s.justify == CENTER { cy += free / 2 }
+        if s.justify == END { cy += free }
+    }
+    var betweenGap = gap
+    if s.justify == BETWEEN and growTotal == 0 and el.children.len() > 1 and h >= 0 { betweenGap = gap + free / (el.children.len() - 1) }
+    var given = 0
+    for i, child in el.children {
+        if i > 0 { cy += betweenGap }
+        let cw = childWidth(child, s, w)
+        var cx = x
+        if s.align == CENTER { cx = x + (w - cw) / 2 }
+        if s.align == END { cx = x + w - cw }
+        if child.style.grow > 0 and h >= 0 {
+            var share = free * child.style.grow / growTotal
+            given += child.style.grow
+            if given == growTotal { share = free - (free * (growTotal - child.style.grow) / growTotal) }
+            heights[i] = layout(child, cx, cy, cw, share)
+        } else if cx != child.x or cy != child.y {
+            moveTo(child, cx, cy)
+        }
+        cy += heights[i]
+    }
+    return cy - y
+}
+
+fn childWidth(child: El, parent: Style, w: int) -> int {
+    if child.style.width >= 0 { return min(clampW(child.style, sc(child.style.width)), w) }
+    // stretch; a max width means "fill up to it" (CSS max-width + auto margins)
+    if parent.align == STRETCH or child.style.maxW >= 0 { return clampW(child.style, w) }
+    return measureW(child, w)
+}
+
+fn moveTo(el: El, x: int, y: int) {
+    let dx = x - el.x
+    let dy = y - el.y
+    shiftXY(el, dx, dy)
+}
+fn shiftXY(el: El, dx: int, dy: int) {
+    el.x += dx
+    el.y += dy
+    for child in el.children { shiftXY(child, dx, dy) }
+}
+
+fn layoutRow(el: El, x: int, y: int, w: int, h: int) -> int {
+    let s = el.style
+    let gap = sc(s.gap)
+    var widths: [int] = []
+    var used = 0
+    var growTotal = 0
+    for i, child in el.children {
+        if i > 0 { used += gap }
+        if child.style.grow > 0 {
+            growTotal += child.style.grow
+            widths.push(0)
+        } else {
+            let cw = measureW(child, max(w - used, 0))
+            widths.push(cw)
+            used += cw
+        }
+    }
+    let free = max(w - used, 0)
+    var given = 0
+    for i, child in el.children {
+        if child.style.grow > 0 {
+            var share = free * child.style.grow / growTotal
+            given += child.style.grow
+            if given == growTotal { share = free - (free * (growTotal - child.style.grow) / growTotal) }
+            widths[i] = clampW(child.style, share)
+        }
+    }
+    // heights at those widths
+    var rowH = 0
+    var heights: [int] = []
+    for i, child in el.children {
+        let ch = layout(child, x, y, widths[i], if h >= 0 and s.align == STRETCH { h } else { 0 - 1 })
+        heights.push(ch)
+        rowH = max(rowH, ch)
+    }
+    let crossH = if h >= 0 { h } else { rowH }
+    var cx = x
+    var betweenGap = gap
+    if growTotal == 0 {
+        var total = 0
+        for i, wi in widths { total += wi + (if i > 0 { gap } else { 0 }) }
+        let remaining = max(w - total, 0)
+        if s.justify == CENTER { cx += remaining / 2 }
+        if s.justify == END { cx += remaining }
+        if s.justify == BETWEEN and el.children.len() > 1 { betweenGap = gap + remaining / (el.children.len() - 1) }
+    }
+    for i, child in el.children {
+        if i > 0 { cx += betweenGap }
+        var cy = y
+        if s.align == STRETCH and heights[i] != crossH and (child.style.height < 0) {
+            heights[i] = layout(child, cx, y, widths[i], crossH)
+        } else {
+            if s.align == CENTER { cy = y + (crossH - heights[i]) / 2 }
+            if s.align == END { cy = y + crossH - heights[i] }
+            moveTo(child, cx, cy)
+        }
+        cx += widths[i]
+    }
+    return crossH
+}
+
+// CSS flex-wrap: children flow left to right and wrap to the next line
+fn layoutWrapRow(el: El, x: int, y: int, w: int, h: int) -> int {
+    let s = el.style
+    let gap = sc(s.gap)
+    var widths: [int] = []
+    for child in el.children {
+        widths.push(min(measureW(child, max(w, 0)), max(w, 0)))
+    }
+    // greedy packing into rows
+    var rowStarts: [int] = []
+    var rowCounts: [int] = []
+    var i = 0
+    while i < el.children.len() {
+        rowStarts.push(i)
+        var count = 0
+        var used = 0
+        while i + count < el.children.len() {
+            let add = widths[i + count] + (if count > 0 { gap } else { 0 })
+            if count > 0 and used + add > w { break }
+            used += add
+            count += 1
+        }
+        if count == 0 { count = 1 }   // a child wider than the row takes a line of its own
+        rowCounts.push(count)
+        i += count
+    }
+    var totalH = 0
+    var ry = y
+    for r in 0..rowStarts.len() {
+        let a = rowStarts[r]
+        let n = rowCounts[r]
+        var hs: [int] = []
+        var rowH = 0
+        for k in 0..n {
+            let ch = layout(el.children[a + k], 0, 0, widths[a + k], 0 - 1)
+            hs.push(ch)
+            rowH = max(rowH, ch)
+        }
+        var total = 0
+        for k in 0..n { total += widths[a + k] + (if k > 0 { gap } else { 0 }) }
+        var cx = x
+        let remaining = max(w - total, 0)
+        if s.justify == CENTER { cx += remaining / 2 }
+        if s.justify == END { cx += remaining }
+        for k in 0..n {
+            if k > 0 { cx += gap }
+            var cy = ry
+            if s.align == CENTER { cy = ry + (rowH - hs[k]) / 2 }
+            if s.align == END { cy = ry + rowH - hs[k] }
+            moveTo(el.children[a + k], cx, cy)
+            cx += widths[a + k]
+        }
+        ry += rowH + gap
+        totalH += rowH + gap
+    }
+    return max(totalH - gap, 0)
+}
+
+// ---- input state ----
+
+var focusId = 0
+var hoverId = 0
+var pressId = 0
+var mouseX = 0
+var mouseY = 0
+var mouseDown = false
+var dragInput = 0
+var dragActive = false
+var dragFn: fn(int, int) = noDrag
+var dragFromX = 0
+var dragFromY = 0
+var lastClickTime = 0
+var clickCount = 0
+var currentCursor = 0 - 1
+var cursorHandles: [int: int] = [:]
+var zuiRoot: El? = none
+var zuiPortals: [El] = []
+var drawingPortals = false
+var zuiRootInst: Inst? = none
+var globalKeyHandler: fn(int, int) -> bool = noKey
+var caretVisible = true
+var focusBorder = 0x7aa2f7ff
+var selectionColor = 0x7aa2f755
+var caretColor = 0xc0caf5ff
+var placeholderColor = 0x6b7089ff
+var scrollbarColor = 0xffffff22
+var lastMods = 0
+var zuiQuit = false
+var pendingFocusKey = ""
+var profiling = false
+// motion: the current frame's time, the step since the last one (clamped, so
+// the first frame after idling still animates), and whether anything is
+// still moving
+var frameNow = 0
+var frameDt = 16.0
+var lastFrameAt = 0
+
+fn pushDying(el: El) {
+    el.dyingAt = SDL_GetTicks()
+    dyingEls.push(el)
+    if lastEl.len() > 512 { lastEl = [:] }   // ponytail: entries are only needed until death + EXIT_MS; cap churn
+}
+var drawAnimating = false
+var drawParentX = 0             // the parent being drawn (layout animation works
+var drawParentY = 0             // relative to it, so moving windows don't glide)
+// tooltips
+const TIP_DELAY = 450
+var tipText = ""
+var tipId = 0
+var tipSince = 0
+var tipRect: (int, int, int, int) = (0, 0, 0, 0)
+var tipHiddenId = 0
+var tipDrawn = false
+var tipFont = 0
+var tipBg = 0x26272aff
+var tipFg = 0xe4e4e7ff
+var tipBorder = 0xffffff14
+
+// deepest element containing (px, py) for which `want` holds, as a path
+fn hitPath(el: El, px: int, py: int, path: [El]) {
+    if px < el.x or py < el.y or px >= el.x + el.w or py >= el.y + el.h {
+        if el.tag != Tag.Comp { return }
+    }
+    path.push(el)
+    // later children paint on top: search them first
+    var i = el.children.len() - 1
+    while i >= 0 {
+        let before = path.len()
+        hitPath(el.children[i], px, py, path)
+        if path.len() > before { return }
+        i -= 1
+    }
+}
+
+fn pathAt(px: int, py: int) -> [El] {
+    var path: [El] = []
+    // the top layer first
+    var i = zuiPortals.len() - 1
+    while i >= 0 {
+        hitPath(zuiPortals[i], px, py, path)
+        if path.len() > 0 { return path }
+        i -= 1
+    }
+    if let root = zuiRoot { hitPath(root, px, py, path) }
+    return path
+}
+
+fn collectPortals(el: El) {
+    if el.portal { zuiPortals.push(el) }
+    for child in el.children { collectPortals(child) }
+}
+
+fn findById(el: El, id: int) -> El? {
+    if let inst = el.inst {
+        if inst.id == id { return el }
+    }
+    for child in el.children {
+        let found = findById(child, id)
+        if found.has() { return found }
+    }
+    return none
+}
+
+fn focusedInput() -> El? {
+    if focusId == 0 { return none }
+    if let root = zuiRoot { return findById(root, focusId) }
+    return none
+}
+
+fn setCursorShape(shape: int) {
+    if shape == currentCursor { return }
+    currentCursor = shape
+    if not cursorHandles.has(shape) { cursorHandles[shape] = SDL_CreateSystemCursor(shape) }
+    SDL_SetCursor(cursorHandles[shape])
+}
+
+fn updateHover() {
+    let path = pathAt(mouseX, mouseY)
+    var hovered = 0
+    var cursorShape = CURSOR_DEFAULT
+    var ids: [int] = []
+    for el in path {
+        if el.hoverGroup { ids.push(el.inst.get().id) }
+    }
+    if ids != hoverIds {
+        hoverIds = ids
+        zuiRedraw = true
+    }
+    var tip = ""
+    var tipEl: El? = none
+    for el in path {
+        if el.clickable or el.style.hoverBg != 0 { hovered = el.inst.get().id }
+        if el.style.cursor >= 0 { cursorShape = el.style.cursor }
+        if el.tip != "" {
+            tip = el.tip
+            tipEl = el
+        }
+    }
+    if let t = tipEl {
+        let id = t.inst.get().id
+        if id != tipId or tip != tipText {
+            if id != tipId { tipSince = SDL_GetTicks() }
+            tipId = id
+            tipText = tip
+            tipDrawn = false
+            zuiRedraw = true
+        }
+        tipRect = (t.x, t.y, t.w, t.h)
+    } else if tipText != "" {
+        tipText = ""
+        tipId = 0
+        tipHiddenId = 0
+        zuiRedraw = true
+    }
+    if dragInput != 0 { cursorShape = CURSOR_TEXT }
+    setCursorShape(cursorShape)
+    if hovered != hoverId {
+        hoverId = hovered
+        zuiRedraw = true
+    }
+}
+
+// byte offset in an input nearest to (px, py)
+fn inputOffsetAt(el: El, px: int, py: int) -> int {
+    let inst = el.inst.get()
+    let s = el.style
+    let lineH = fontLineHeight(s.font)
+    let top = el.y + sc(s.padT) - inst.scroll
+    var lineIndex = (py - top) / lineH
+    if py < top { lineIndex = 0 }
+    lineIndex = max(0, min(lineIndex, inst.plain.len() - 1))
+    let line = inst.plain[lineIndex]
+    return offsetInLine(s.font, el.value, line, px - (el.x + sc(s.padL) + 1))
+}
+
+fn offsetInLine(fontId: int, content: str, line: PlainLine, targetX: int) -> int {
+    var x = 0
+    var i = line.lo
+    while i < line.hi {
+        let (cp, len) = utf8At(content, i)
+        let adv = charAdvance(fontId, cp)
+        if x + adv / 2 > targetX { return i }
+        x += adv
+        i += len
+    }
+    return line.hi
+}
+
+fn lineOfOffset(inst: Inst, offset: int) -> int {
+    for i, line in inst.plain {
+        if offset < line.hi or (offset == line.hi and (i == inst.plain.len() - 1 or inst.plain[i + 1].lo > line.hi)) { return i }
+    }
+    return max(inst.plain.len() - 1, 0)
+}
+
+fn isWordByte(b: int) -> bool {
+    return (b >= 48 and b <= 57) or (b >= 65 and b <= 90) or (b >= 97 and b <= 122) or b == 95 or b >= 128
+}
+fn wordLeft(content: str, i: int) -> int {
+    var j = i
+    while j > 0 and not isWordByte(content.byte(j - 1)) { j -= 1 }
+    while j > 0 and isWordByte(content.byte(j - 1)) { j -= 1 }
+    return j
+}
+fn wordRight(content: str, i: int) -> int {
+    var j = i
+    let n = content.len()
+    while j < n and not isWordByte(content.byte(j)) { j += 1 }
+    while j < n and isWordByte(content.byte(j)) { j += 1 }
+    return j
+}
+
+fn selectionRange(inst: Inst) -> (int, int) {
+    return (min(inst.cursor, inst.anchor), max(inst.cursor, inst.anchor))
+}
+
+fn replaceSelection(el: El, insert: str) {
+    let inst = el.inst.get()
+    inst.cursor = max(0, min(inst.cursor, el.value.len()))
+    inst.anchor = max(0, min(inst.anchor, el.value.len()))
+    let (lo, hi) = selectionRange(inst)
+    let value = el.value
+    let next = value.sub(0, lo) + insert + value.sub(hi, value.len())
+    inst.cursor = lo + insert.len()
+    inst.anchor = inst.cursor
+    inst.preferredX = 0 - 1
+    el.value = next
+    let changed = el.onChange
+    changed(next)
+    zuiDirty = true
+}
+
+fn clipboardText() -> str {
+    let p = SDL_GetClipboardText()
+    let t = strFromC(p)
+    if p != 0 { SDL_free(p) }
+    return t.replace("\r\n", "\n")
+}
+
+fn moveCaret(el: El, to: int, extend: bool) {
+    let inst = el.inst.get()
+    inst.cursor = max(0, min(to, el.value.len()))
+    if not extend { inst.anchor = inst.cursor }
+    zuiRedraw = true
+    caretVisible = true
+}
+
+fn verticalMove(el: El, direction: int, extend: bool) -> bool {
+    let inst = el.inst.get()
+    let lineIndex = lineOfOffset(inst, inst.cursor)
+    let target = lineIndex + direction
+    if target < 0 or target >= inst.plain.len() { return false }
+    let s = el.style
+    if inst.preferredX < 0 {
+        let line = inst.plain[lineIndex]
+        inst.preferredX = textWidthRange(s.font, el.value, line.lo, inst.cursor)
+    }
+    let keep = inst.preferredX
+    moveCaret(el, offsetInLine(s.font, el.value, inst.plain[target], keep), extend)
+    inst.preferredX = keep
+    return true
+}
+
+// editing keys for the focused input; true when consumed
+fn inputKey(el: El, key: int, mods: int) -> bool {
+    let inst = el.inst.get()
+    let ctrl = (mods & MOD_CTRL) != 0
+    let shift = (mods & MOD_SHIFT) != 0
+    let value = el.value
+    inst.cursor = min(inst.cursor, value.len())
+    inst.anchor = min(inst.anchor, value.len())
+    let keyFn = el.onKey
+    if keyFn(key, mods) { return true }
+    if key == KEY_RETURN or key == KEY_KP_ENTER {
+        if shift {
+            replaceSelection(el, "\n")
+        } else {
+            let submitFn = el.onSubmit
+            submitFn(value)
+        }
+        return true
+    }
+    if key == KEY_BACKSPACE {
+        if inst.cursor == inst.anchor and inst.cursor > 0 {
+            inst.anchor = if ctrl { wordLeft(value, inst.cursor) } else { utf8Prev(value, inst.cursor) }
+        }
+        replaceSelection(el, "")
+        return true
+    }
+    if key == KEY_DELETE {
+        if inst.cursor == inst.anchor and inst.cursor < value.len() {
+            inst.anchor = if ctrl { wordRight(value, inst.cursor) } else { utf8Next(value, inst.cursor) }
+        }
+        replaceSelection(el, "")
+        return true
+    }
+    if key == KEY_LEFT {
+        if inst.cursor != inst.anchor and not shift {
+            moveCaret(el, selectionRange(inst).0, false)
+        } else {
+            moveCaret(el, if ctrl { wordLeft(value, inst.cursor) } else { utf8Prev(value, inst.cursor) }, shift)
+        }
+        inst.preferredX = 0 - 1
+        return true
+    }
+    if key == KEY_RIGHT {
+        if inst.cursor != inst.anchor and not shift {
+            moveCaret(el, selectionRange(inst).1, false)
+        } else {
+            moveCaret(el, if ctrl { wordRight(value, inst.cursor) } else { utf8Next(value, inst.cursor) }, shift)
+        }
+        inst.preferredX = 0 - 1
+        return true
+    }
+    if key == KEY_UP { return verticalMove(el, 0 - 1, shift) }
+    if key == KEY_DOWN { return verticalMove(el, 1, shift) }
+    if key == KEY_HOME {
+        let line = inst.plain[lineOfOffset(inst, inst.cursor)]
+        moveCaret(el, if ctrl { 0 } else { line.lo }, shift)
+        inst.preferredX = 0 - 1
+        return true
+    }
+    if key == KEY_END {
+        let line = inst.plain[lineOfOffset(inst, inst.cursor)]
+        moveCaret(el, if ctrl { value.len() } else { line.hi }, shift)
+        inst.preferredX = 0 - 1
+        return true
+    }
+    if ctrl and key == 97 {            // a: select all
+        inst.anchor = 0
+        moveCaret(el, value.len(), true)
+        return true
+    }
+    if ctrl and (key == 99 or key == 120) {          // c, x
+        let (lo, hi) = selectionRange(inst)
+        if hi == lo { return false }
+        if hi > lo {
+            SDL_SetClipboardText(cstr(value.sub(lo, hi)))
+            if key == 120 { replaceSelection(el, "") }
+        }
+        return true
+    }
+    if ctrl and key == 118 {           // v
+        let pasteFn = pasteHandler
+        if pasteFn() { return true }
+        replaceSelection(el, clipboardText())
+        return true
+    }
+    return false
+}
+
+// ---- drawing ----
+
+fn drawEl(el: El) {
+    if el.portal and not drawingPortals { return }       // drawn after the tree
+    if el.hoverOnly and not hoverGroupShown { return }
+    if el.enter == 0 and not el.layoutAnim and el.alpha == 255 {
+        drawElBody(el)
+        return
+    }
+    let savedAlpha = gfxAlpha
+    if el.alpha != 255 { gfxAlpha = gfxAlpha * (el.alpha as float) / 255.0 }
+    var dx = 0
+    var dy = 0
+    if let inst = el.inst {
+        if el.enter != 0 {
+            if inst.bornAt == 0 { inst.bornAt = frameNow }
+            let t = (frameNow - inst.bornAt - el.enterDelay) as float / ENTER_MS
+            if t < 1.0 {
+                let e = if t <= 0.0 { 0.0 } else { easeOut(t) }
+                gfxAlpha = gfxAlpha * e
+                if el.enter == ENTER_RISE { dy = ((1.0 - e) * sc(10)) as int }
+                if el.enter == ENTER_DROP { dy = 0 - ((1.0 - e) * sc(6)) as int }
+                drawAnimating = true
+            }
+        }
+        if el.layoutAnim {
+            // where layout put it inside its parent
+            let lx = el.x - drawParentX
+            let ly = el.y - drawParentY
+            if inst.lastX != 0 - 1 and (lx != inst.lastX or ly != inst.lastY) {
+                inst.offX += (inst.lastX - lx) as float
+                inst.offY += (inst.lastY - ly) as float
+            }
+            inst.lastX = lx
+            inst.lastY = ly
+            if inst.offX != 0.0 or inst.offY != 0.0 {
+                // spring settle (Motion-style): stiffness + damping, natural overshoot
+                let dt = frameDt / 1000.0
+                inst.velX += (-SPRING_K * inst.offX - SPRING_C * inst.velX) * dt
+                inst.velY += (-SPRING_K * inst.offY - SPRING_C * inst.velY) * dt
+                inst.offX += inst.velX * dt
+                inst.offY += inst.velY * dt
+                if abs(inst.offX) < 0.5 and abs(inst.velX) < 0.5 {
+                    inst.offX = 0.0
+                    inst.velX = 0.0
+                }
+                if abs(inst.offY) < 0.5 and abs(inst.velY) < 0.5 {
+                    inst.offY = 0.0
+                    inst.velY = 0.0
+                }
+                dx += inst.offX as int
+                dy += inst.offY as int
+                drawAnimating = true
+            }
+        }
+    }
+    if dx != 0 or dy != 0 {
+        shiftXY(el, dx, dy)
+        drawElBody(el)
+        shiftXY(el, 0 - dx, 0 - dy)
+    } else {
+        drawElBody(el)
+    }
+    gfxAlpha = savedAlpha
+}
+
+fn drawElBody(el: El) {
+    let clip = currentClip()
+    if el.y > clip.1 + clip.3 or el.y + el.h < clip.1 { return }
+    if el.x > clip.0 + clip.2 or el.x + el.w < clip.0 { return }
+    let s = el.style
+    var bg = s.bg
+    if let inst = el.inst {
+        if s.hoverBg != 0 {
+            let target = if inst.id == hoverId { 1.0 } else { 0.0 }
+            if inst.hoverMix != target {
+                let step = frameDt / HOVER_MS
+                inst.hoverMix = if target > inst.hoverMix { min(inst.hoverMix + step, 1.0) } else { max(inst.hoverMix - step, 0.0) }
+                drawAnimating = true
+            }
+            if inst.hoverMix > 0.0 { bg = mixColor(s.bg, s.hoverBg, easeOut(inst.hoverMix)) }
+        }
+        if inst.id == pressId and s.pressBg != 0 { bg = s.pressBg }
+    }
+    let r = sc(s.radius)
+    if s.shadow > 0 { drawShadow(el.x, el.y, el.w, el.h, r, sc(s.shadow)) }
+    if bg != 0 { fillRound(el.x, el.y, el.w, el.h, r, bg) }
+    if el.image > 0 { drawImage(el.image, el.x, el.y, el.w, el.h) }
+    if s.border != 0 {
+        var borderColor = s.border
+        if el.tag == Tag.Input and el.inst.has() and el.inst.get().id == focusId { borderColor = focusBorder }
+        strokeRound(el.x, el.y, el.w, el.h, r, max(sc(s.borderW), 1), borderColor)
+    }
+    if el.painted {
+        let paintFn = el.paint
+        paintFn(el.x, el.y, el.w, el.h)
+        if el.animated { drawAnimating = true }
+    }
+    let innerX = el.x + sc(s.padL)
+    let innerY = el.y + sc(s.padT)
+    if el.tag == Tag.Text {
+        let inst = el.inst.get()
+        // the selected byte range in this element, if any
+        var selLo = 0
+        var selHi = 0
+        if selActive {
+            let (first, last) = selectionSpan()
+            let k = textIndexOf.get(inst.id).or(0 - 1)
+            if k >= 0 and first.0 >= 0 and k >= first.0 and k <= last.0 {
+                selLo = if k == first.0 { first.1 } else { 0 }
+                selHi = if k == last.0 { last.1 } else { 1000000000 }
+            }
+        }
+        for line in inst.lines {
+            let ly = innerY + line.y
+            if ly > clip.1 + clip.3 { break }
+            if ly + line.h < clip.1 { continue }
+            if selHi > selLo {
+                for run in line.runs {
+                    let a = max(selLo, run.lo)
+                    let b = min(selHi, run.lo + run.text.len())
+                    if b > a {
+                        let x0 = innerX + run.x + textWidthRange(run.font, run.text, 0, a - run.lo)
+                        let x1 = innerX + run.x + textWidthRange(run.font, run.text, 0, b - run.lo)
+                        fillRect(x0, ly, x1 - x0, line.h, selectionFill)
+                    }
+                }
+            }
+            for run in line.runs {
+                let runY = ly + (line.h - fontLineHeight(run.font)) / 2
+                if run.bg != 0 { fillRound(innerX + run.x - sc(2), runY, run.width + sc(4), fontLineHeight(run.font), sc(4), run.bg) }
+                let ignored = drawText(run.font, innerX + run.x, runY, run.text, run.color)
+            }
+        }
+        return
+    }
+    if el.tag == Tag.Input {
+        drawInput(el, innerX, innerY)
+        return
+    }
+    let clipping = s.clip or el.tag == Tag.Scroll
+    if clipping { pushClip(el.x, el.y, el.w, el.h) }
+    let savedShown = hoverGroupShown
+    if el.hoverGroup {
+        hoverGroupShown = false
+        let id = el.inst.get().id
+        for h in hoverIds {
+            if h == id { hoverGroupShown = true }
+        }
+    }
+    let savedPX = drawParentX
+    let savedPY = drawParentY
+    drawParentX = el.x
+    drawParentY = el.y
+    for child in el.children { drawEl(child) }
+    drawParentX = savedPX
+    drawParentY = savedPY
+    hoverGroupShown = savedShown
+    if el.tag == Tag.Scroll { drawScrollbar(el) }
+    if clipping { popClip() }
+}
+
+
+// the hovered element's tooltip, drawn over everything once the pointer has
+// rested on it for TIP_DELAY ms (Radix Tooltip's delayDuration)
+fn drawTooltip() {
+    if tipText == "" or mouseDown or tipId == tipHiddenId { return }
+    let age = frameNow - tipSince - TIP_DELAY
+    if age < 0 { return }
+    let a = min(age as float / 120.0, 1.0)
+    if a < 1.0 { drawAnimating = true } else { tipDrawn = true }
+    let padX = sc(8)
+    let padY = sc(5)
+    let w = textWidth(tipFont, tipText) + 2 * padX
+    let h = fontLineHeight(tipFont) + 2 * padY
+    let (rx, ry, rw, rh) = tipRect
+    let x = max(sc(4), min(rx + rw / 2 - w / 2, gfxWidth - w - sc(4)))
+    var y = ry + rh + sc(6)
+    if y + h > gfxHeight - sc(4) { y = ry - h - sc(6) }
+    let saved = gfxAlpha
+    gfxAlpha = easeOut(a)
+    let rise = ((1.0 - easeOut(a)) * sc(3)) as int
+    drawShadow(x, y - rise, w, h, sc(6), sc(8))
+    fillRound(x, y - rise, w, h, sc(6), tipBg)
+    strokeRound(x, y - rise, w, h, sc(6), 1, tipBorder)
+    let ignored = drawText(tipFont, x + padX, y - rise + padY, tipText, tipFg)
+    gfxAlpha = saved
+}
+
+fn drawScrollbar(el: El) {
+    let inst = el.inst.get()
+    let viewport = el.h - vPad(el.style)
+    if inst.contentH <= viewport or viewport <= 0 { return }
+    let trackH = el.h - sc(8)
+    let thumbH = max(trackH * viewport / inst.contentH, sc(24))
+    let thumbY = el.y + sc(4) + (trackH - thumbH) * inst.scroll / max(inst.contentH - viewport, 1)
+    fillRound(el.x + el.w - sc(7), thumbY, sc(4), thumbH, sc(2), scrollbarColor)
+}
+
+fn drawInput(el: El, innerX: int, innerY: int) {
+    let inst = el.inst.get()
+    let s = el.style
+    let lineH = fontLineHeight(s.font)
+    let viewH = el.h - vPad(s)
+    // keep the caret in view
+    let caretLine = lineOfOffset(inst, min(inst.cursor, el.value.len()))
+    let caretTop = caretLine * lineH
+    if caretTop - inst.scroll < 0 { inst.scroll = caretTop }
+    if caretTop + lineH - inst.scroll > viewH { inst.scroll = caretTop + lineH - viewH }
+    inst.scroll = max(0, min(inst.scroll, max(inst.plain.len() * lineH - viewH, 0)))
+    pushClip(el.x, innerY, el.w, viewH)
+    let x0 = innerX + 1
+    let y0 = innerY - inst.scroll
+    if el.value == "" and el.placeholder != "" {
+        let ignored = drawText(s.font, x0, y0, el.placeholder, placeholderColor)
+    }
+    let focused = inst.id == focusId
+    let (lo, hi) = selectionRange(inst)
+    for i, line in inst.plain {
+        let ly = y0 + i * lineH
+        if ly + lineH < innerY or ly > innerY + viewH { continue }
+        if focused and hi > lo and lo <= line.hi and hi >= line.lo {
+            let a = max(lo, line.lo)
+            let b = min(hi, line.hi)
+            let sx = x0 + textWidthRange(s.font, el.value, line.lo, a)
+            var sw = textWidthRange(s.font, el.value, a, b)
+            if hi > line.hi { sw += sc(6) }
+            fillRect(sx, ly, sw, lineH, selectionColor)
+        }
+        let ignored = drawTextRange(s.font, x0, ly, el.value, line.lo, line.hi, s.color)
+    }
+    if focused and caretVisible {
+        let line = inst.plain[caretLine]
+        let cx = x0 + textWidthRange(s.font, el.value, line.lo, min(inst.cursor, line.hi))
+        let cy = y0 + caretLine * lineH
+        fillRect(cx, cy + sc(2), max(sc(2), 1), lineH - sc(4), caretColor)
+        // tell the IME where the caret is
+        let area = cstrIn(6, "")
+        store32(area, ((cx / pixelScale) as int))
+        store32(area + 4, ((cy / pixelScale) as int))
+        store32(area + 8, 1)
+        store32(area + 12, ((lineH / pixelScale) as int))
+        SDL_SetTextInputArea(zuiWindow, area, 0)
+    }
+    popClip()
+}
+
+// ---- the app loop ----
+
+struct App {
+    title: str
+    background: int
+    render: fn(Ctx) -> El
+    // called every loop turn; returns the next wait in ms (-1: until an event)
+    tick: fn() -> int = noTick
+    // runs once the renderer exists: open fonts here (font 0 is the default)
+    setup: fn() = noAction
+}
+
+fn noTick() -> int { return 0 - 1 }
+
+fn quit() { zuiQuit = true }
+
+// the window size in logical units, for layouts that adapt to it
+var viewW = 1200
+var viewH = 800
+
+var forcedWidth = 0 - 1            // ZUI_WIDTH: lay out at this logical width (testing)
+
+fn rebuild(app: App, givenWidth: int, height: int) {
+    if forcedWidth < 0 {
+        let env = envVar("ZUI_WIDTH")
+        forcedWidth = if env == "" { 0 } else { env as int }
+    }
+    let width = if forcedWidth > 0 { min(givenWidth, sc(forcedWidth)) } else { givenWidth }
+    viewW = ((width as float) / uiScale) as int
+    viewH = ((height as float) / uiScale) as int
+    let root = component("root", app.render)
+    zuiRootInst = reconcile(root, zuiRootInst)
+    zuiAnimating = false
+    let used = layout(root, 0, 0, width, height)
+    zuiRoot = root
+    textOrder = []
+    allText = []
+    textIndexOf = [:]
+    collectText(root)
+    zuiPortals = []
+    collectPortals(root)
+    if pendingFocusKey != "" {
+        if let target = findByKey(root, pendingFocusKey) {
+            focusId = target.inst.get().id
+            let inst = target.inst.get()
+            inst.cursor = if pendingFocusPos >= 0 { min(pendingFocusPos, target.value.len()) } else { target.value.len() }
+            inst.anchor = inst.cursor
+            inst.preferredX = 0 - 1
+            pendingFocusPos = 0 - 1
+        }
+        pendingFocusKey = ""
+    }
+    // autofocus: the first input marked autofocus, if nothing is focused
+    if focusId == 0 or not focusedInput().has() { focusFirst(root) }
+}
+
+fn findByKey(el: El, key: str) -> El? {
+    if el.key == key and el.tag == Tag.Input { return el }
+    for child in el.children {
+        let found = findByKey(child, key)
+        if found.has() { return found }
+    }
+    return none
+}
+
+// focus the input with this key after the next render (caret at the end)
+fn requestFocus(key: str) {
+    pendingFocusKey = key
+    zuiDirty = true
+}
+// ... with the caret at byte `pos`
+fn requestFocusAt(key: str, pos: int) {
+    pendingFocusKey = key
+    pendingFocusPos = pos
+    zuiDirty = true
+}
+
+// the caret of the input with this key (its value length when unknown)
+fn caretOf(key: str) -> int {
+    if let root = zuiRoot {
+        if let el = findByKey(root, key) { return min(el.inst.get().cursor, el.value.len()) }
+    }
+    return 0 - 1
+}
+
+fn collectText(el: El) {
+    if el.tag == Tag.Text {
+        allText.push(el)
+        if el.selectable {
+            let inst = el.inst.get()
+            textIndexOf[inst.id] = textOrder.len()
+            textOrder.push(el)
+        }
+    }
+    for child in el.children { collectText(child) }
+}
+
+// ---- text selection ----
+
+fn elText(el: El) -> str {
+    if el.spans.len() == 1 { return el.spans[0].text }
+    var parts: [str] = []
+    for span in el.spans { parts.push(span.text) }
+    return parts.join()
+}
+
+// byte offset in a text element nearest to (px, py)
+fn textOffsetAt(el: El, px: int, py: int) -> int {
+    let inst = el.inst.get()
+    let innerX = el.x + sc(el.style.padL)
+    let innerY = el.y + sc(el.style.padT)
+    if inst.lines.len() == 0 { return 0 }
+    if py < innerY { return 0 }
+    var lineIndex = inst.lines.len() - 1
+    for i, line in inst.lines {
+        if py < innerY + line.y + line.h {
+            lineIndex = i
+            break
+        }
+    }
+    if py >= innerY + inst.textH { return elText(el).len() }
+    let line = inst.lines[lineIndex]
+    if line.runs.len() == 0 {
+        var k = lineIndex - 1
+        while k >= 0 {
+            let previous = inst.lines[k]
+            if previous.runs.len() > 0 {
+                let last = previous.runs[previous.runs.len() - 1]
+                return last.lo + last.text.len() + 1
+            }
+            k -= 1
+        }
+        return 0
+    }
+    let x = px - innerX
+    for run in line.runs {
+        if x < run.x { return run.lo }
+        if x < run.x + run.width {
+            var w = run.x
+            var i = 0
+            while i < run.text.len() {
+                let (cp, len) = utf8At(run.text, i)
+                let adv = charAdvance(run.font, cp)
+                if w + adv / 2 > x { return run.lo + i }
+                w += adv
+                i += len
+            }
+            return run.lo + run.text.len()
+        }
+    }
+    let last = line.runs[line.runs.len() - 1]
+    return last.lo + last.text.len()
+}
+
+// the text element under (px, py), or the nearest one in the same column
+fn textNear(px: int, py: int) -> (El?, int) {
+    var best: El? = none
+    var bestDistance = 1000000000
+    for el in textOrder {
+        if px < el.x - sc(80) or px > el.x + el.w + sc(80) { continue }
+        if py >= el.y and py < el.y + el.h and px >= el.x and px < el.x + el.w { return (el, textOffsetAt(el, px, py)) }
+        let distance = if py < el.y { el.y - py } else if py >= el.y + el.h { py - (el.y + el.h) } else { 0 }
+        if distance < bestDistance {
+            bestDistance = distance
+            best = el
+        }
+    }
+    if let el = best {
+        if py < el.y { return (el, 0) }
+        if py >= el.y + el.h { return (el, elText(el).len()) }
+        return (el, textOffsetAt(el, px, py))
+    }
+    return (none, 0)
+}
+
+// ((first index, offset), (last index, offset)) in document order
+fn selectionSpan() -> ((int, int), (int, int)) {
+    let a = textIndexOf.get(selAId).or(0 - 1)
+    let b = textIndexOf.get(selBId).or(0 - 1)
+    if a < 0 or b < 0 { return ((0 - 1, 0), (0 - 1, 0)) }
+    if a < b or (a == b and selAOff <= selBOff) { return ((a, selAOff), (b, selBOff)) }
+    return ((b, selBOff), (a, selAOff))
+}
+
+fn selectedText() -> str {
+    if not selActive { return "" }
+    let (first, last) = selectionSpan()
+    if first.0 < 0 { return "" }
+    var parts: [str] = []
+    for k in first.0..last.0 + 1 {
+        let content = elText(textOrder[k])
+        let lo = if k == first.0 { min(first.1, content.len()) } else { 0 }
+        let hi = if k == last.0 { min(last.1, content.len()) } else { content.len() }
+        if hi > lo { parts.push(content.sub(lo, hi)) }
+    }
+    return parts.join("\n")
+}
+
+fn clearSelection() {
+    if selActive {
+        selActive = false
+        zuiRedraw = true
+    }
+}
+
+fn autofocus(el: El) -> El {
+    el.autofocus = true
+    return el
+}
+
+fn focusFirst(el: El) -> bool {
+    if el.tag == Tag.Input and el.autofocus {
+        focusId = el.inst.get().id
+        return true
+    }
+    for child in el.children {
+        if focusFirst(child) { return true }
+    }
+    return false
+}
+
+fn zuiRun(app: App, width: int, height: int) {
+    if not SDL_Init(SDL_INIT_VIDEO) { panic("SDL_Init: " + sdlError()) }
+    var windowFlags = SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY
+    // scripted test runs must never take the user's keyboard
+    if envVar("ZUI_SCRIPT") != "" { windowFlags = windowFlags | 2147483648 }      // SDL_WINDOW_NOT_FOCUSABLE
+    zuiWindow = SDL_CreateWindow(cstr(app.title), width, height, windowFlags)
+    if zuiWindow == 0 { panic("window: " + sdlError()) }
+    SDL_SetWindowMinimumSize(zuiWindow, 480, 360)
+    let renderer = SDL_CreateRenderer(zuiWindow, 0)
+    if renderer == 0 { panic("renderer: " + sdlError()) }
+    SDL_SetRenderVSync(renderer, 1)
+    gfxInit(renderer)
+    SDL_StartTextInput(zuiWindow)
+    let event = nativeAlloc(128)
+    let sizeBuffer = nativeAlloc(16)
+    SDL_GetWindowSizeInPixels(zuiWindow, sizeBuffer, sizeBuffer + 4)
+    let firstPixelW = load32(sizeBuffer)
+    SDL_GetWindowSize(zuiWindow, sizeBuffer, sizeBuffer + 4)
+    pixelScale = firstPixelW * 1.0 / max(load32(sizeBuffer), 1)
+    let zoomEnv = envVar("ZUI_SCALE")
+    if zoomEnv != "" { setZoom(zoomEnv as float) }
+    autoZoom()
+    uiScale = pixelScale * uiZoom
+    uiFontScale = uiScale
+    var lastDisplay = SDL_GetDisplayForWindow(zuiWindow)
+    let setupFn = app.setup
+    setupFn()
+    let screenshot = envVar("ZUI_SCREENSHOT")
+    var screenshotFrames = 0
+    if screenshot != "" {
+        let frames = envVar("ZUI_FRAMES")
+        screenshotFrames = if frames == "" { 3 } else { frames as int }
+    }
+    var frame = 0
+    var pixelW = 0
+    var pixelH = 0
+    var nextWait = 0
+    profiling = envVar("ZUI_PROFILE") != ""
+    let script = envVar("ZUI_SCRIPT")
+    var steps: [str] = []
+    if script != "" { steps = script.split(";") }
+    var stepIndex = 0
+    var stepWaitUntil = 0
+    var stepShot = ""
+    while not zuiQuit {
+        var got = SDL_WaitEventTimeout(event, if nextWait < 0 { 1000 } else { nextWait })
+        while got {
+            handleEvent(event)
+            got = SDL_PollEvent(event)
+        }
+        let tickFn = app.tick
+        nextWait = tickFn()
+        // ZUI_SCRIPT: synthetic input for testing, "type hi;key 13;wait 500;click 40 80;shot /tmp/a.bmp;quit"
+        if stepIndex < steps.len() {
+            nextWait = 16
+            if SDL_GetTicks() >= stepWaitUntil and not zuiDirty {
+                let step = steps[stepIndex].trim()
+                stepIndex += 1
+                stepWaitUntil = SDL_GetTicks() + 60
+                let space = step.indexOf(" ")
+                let verb = if space < 0 { step } else { step.sub(0, space) }
+                let rest = if space < 0 { "" } else { step.sub(space + 1, step.len()) }
+                scriptStep(event, verb, rest)
+                if verb == "wait" { stepWaitUntil = SDL_GetTicks() + (rest as int) }
+                if verb == "shot" {
+                    stepShot = rest
+                    zuiRedraw = true
+                }
+            }
+        }
+        if screenshotFrames > 0 {
+            nextWait = 16
+            zuiRedraw = true
+        }
+        SDL_GetWindowSizeInPixels(zuiWindow, sizeBuffer, sizeBuffer + 4)
+        let pw = load32(sizeBuffer)
+        let ph = load32(sizeBuffer + 4)
+        SDL_GetWindowSize(zuiWindow, sizeBuffer, sizeBuffer + 4)
+        let lw = max(load32(sizeBuffer), 1)
+        if pw != pixelW or ph != pixelH {
+            pixelW = pw
+            pixelH = ph
+            pixelScale = pw * 1.0 / lw
+            applyScale()
+            zuiDirty = true
+        }
+        let display = SDL_GetDisplayForWindow(zuiWindow)
+        if display != lastDisplay {
+            lastDisplay = display
+            autoZoom()
+        }
+        if zuiAnimating {
+            zuiDirty = true
+            nextWait = min(if nextWait < 0 { 16 } else { nextWait }, 12)
+        }
+        // wake up when a pending tooltip is due
+        if tipText != "" and not tipDrawn and tipId != tipHiddenId and not mouseDown {
+            let due = tipSince + TIP_DELAY - SDL_GetTicks()
+            if due <= 0 { zuiRedraw = true } else { nextWait = if nextWait < 0 { due } else { min(nextWait, due) } }
+        }
+        if zuiDirty {
+            zuiDirty = false
+            let started = SDL_GetTicks()
+            rebuild(app, pixelW, pixelH)
+            if profiling { print("rebuild {SDL_GetTicks() - started} ms") }
+            updateHover()
+            zuiRedraw = true
+        }
+        if zuiRedraw {
+            zuiRedraw = false
+            let drawStarted = SDL_GetTicks()
+            frameNow = drawStarted
+            frameDt = min(max((frameNow - lastFrameAt) as float, 1.0), 33.0)
+            lastFrameAt = frameNow
+            drawAnimating = false
+            drawParentX = 0
+            drawParentY = 0
+            beginFrame(pixelW, pixelH, app.background)
+
+            if let root = zuiRoot { drawEl(root) }
+            drawingPortals = true
+            for p in zuiPortals {
+                drawParentX = p.x
+                drawParentY = p.y
+                drawEl(p)
+            }
+            drawingPortals = false
+            // exit transitions: removed subtrees keep drawing until their fade ends.
+            // Compiler bug: reading a struct field inline in arithmetic inside this loop
+            // (let t = (nowMs - el.dyingAt) ...) miscompiles and the quads vanish,
+            // so the field is read into its own local first.
+            if dyingEls.len() > 0 {
+                let nowMs = SDL_GetTicks()
+                var kept: [El] = []
+                for i in 0..dyingEls.len() {
+                    let el = dyingEls[i]
+                    let at = el.dyingAt
+                    let t = (nowMs - at) as float / EXIT_MS
+                    if t >= 1.0 { continue }
+                    gfxAlpha = 1.0 - easeOut(t)
+                    if el.exit == EXIT_RISE {
+                        shiftXY(el, 0, -8)
+                        drawEl(el)
+                        shiftXY(el, 0, 8)
+                    } else if el.exit == EXIT_DROP {
+                        shiftXY(el, 0, 8)
+                        drawEl(el)
+                        shiftXY(el, 0, -8)
+                    } else {
+                        drawEl(el)
+                    }
+                    gfxAlpha = 1.0
+                    kept.push(el)
+                }
+                dyingEls = kept
+                drawAnimating = true
+            }
+            drawTooltip()
+            if profiling { print("draw {SDL_GetTicks() - drawStarted} ms") }
+            frame += 1
+            var shotPath = ""
+            if screenshotFrames > 0 and frame >= screenshotFrames { shotPath = screenshot }
+            if stepShot != "" { shotPath = stepShot }
+            endFrame(shotPath)
+            if shotPath != "" and stepShot == "" { zuiQuit = true }
+            stepShot = ""
+            if drawAnimating {
+                zuiRedraw = true
+                nextWait = if nextWait < 0 { 8 } else { min(nextWait, 8) }
+            }
+        }
+    }
+    SDL_Quit()
+}
+
+fn handleEvent(event: int) {
+    let kind = load32(event)
+    if kind == SDL_EVENT_QUIT or kind == SDL_EVENT_WINDOW_CLOSE_REQUESTED {
+        zuiQuit = true
+        return
+    }
+    if kind == SDL_EVENT_WINDOW_EXPOSED or kind == SDL_EVENT_WINDOW_FOCUS_GAINED or kind == SDL_EVENT_WINDOW_FOCUS_LOST {
+        zuiRedraw = true
+        return
+    }
+    if kind == SDL_EVENT_WINDOW_RESIZED or kind == SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED or kind == SDL_EVENT_WINDOW_DISPLAY_SCALE_CHANGED {
+        zuiDirty = true
+        return
+    }
+    if kind == SDL_EVENT_WINDOW_MOUSE_LEAVE {
+        hoverId = 0
+        tipText = ""
+        tipId = 0
+        zuiRedraw = true
+        return
+    }
+    if kind == SDL_EVENT_MOUSE_MOTION {
+        mouseX = (floatAt(event + 28) * pixelScale) as int
+        mouseY = (floatAt(event + 32) * pixelScale) as int
+        updateHover()
+        if dragActive and mouseDown {
+            let call = dragFn
+            call(((mouseX - dragFromX) as float / uiScale) as int, ((mouseY - dragFromY) as float / uiScale) as int)
+            zuiDirty = true
+            return
+        }
+        if selecting and mouseDown {
+            let (near, offset) = textNear(mouseX, mouseY)
+            if let el = near {
+                selBId = el.inst.get().id
+                selBOff = offset
+                zuiRedraw = true
+            }
+        }
+        if dragInput != 0 and mouseDown {
+            if let root = zuiRoot {
+                if let el = findById(root, dragInput) {
+                    let inst = el.inst.get()
+                    inst.cursor = inputOffsetAt(el, mouseX, mouseY)
+                    zuiRedraw = true
+                }
+            }
+        }
+        return
+    }
+    if kind == SDL_EVENT_MOUSE_BUTTON_DOWN {
+        mouseX = (floatAt(event + 28) * pixelScale) as int
+        mouseY = (floatAt(event + 32) * pixelScale) as int
+        tipHiddenId = tipId            // a click dismisses the tooltip until the pointer moves on
+        if load8(event + 24) != 1 { return }
+        mouseDown = true
+        let clicks = load8(event + 26)
+        let path = pathAt(mouseX, mouseY)
+        pressId = 0
+        var focused = false
+        var interactive = false
+        var textHit: El? = none
+        for el in path {
+            if el.clickable or el.tag == Tag.Input { interactive = true }
+            if el.tag == Tag.Text and el.selectable { textHit = el }
+        }
+        clearSelection()
+        selecting = false
+        if not interactive {
+            if let el = textHit {
+                let inst = el.inst.get()
+                let at = textOffsetAt(el, mouseX, mouseY)
+                selActive = true
+                selecting = true
+                selAId = inst.id
+                selBId = inst.id
+                selAOff = at
+                selBOff = at
+                let content = elText(el)
+                if clicks == 2 {
+                    selAOff = wordLeft(content, min(at + 1, content.len()))
+                    selBOff = max(wordRight(content, at), selAOff)
+                } else if clicks >= 3 {
+                    selAOff = 0
+                    selBOff = content.len()
+                }
+            }
+        }
+        dragActive = false
+        for el in path {
+            if el.clickable { pressId = el.inst.get().id }
+            if el.draggable {
+                dragActive = true
+                dragFn = el.onDrag
+                dragFromX = mouseX
+                dragFromY = mouseY
+            }
+            if el.clickable and not el.draggable { dragActive = false }
+            if el.tag == Tag.Input {
+                let inst = el.inst.get()
+                focusId = inst.id
+                focused = true
+                let at = inputOffsetAt(el, mouseX, mouseY)
+                if clicks >= 3 {
+                    inst.anchor = 0
+                    inst.cursor = el.value.len()
+                } else if clicks == 2 {
+                    inst.anchor = wordLeft(el.value, min(at + 1, el.value.len()))
+                    inst.cursor = wordRight(el.value, at)
+                    if inst.cursor < inst.anchor { inst.cursor = inst.anchor }
+                } else {
+                    inst.cursor = at
+                    if (modState() & MOD_SHIFT) == 0 { inst.anchor = at }
+                    dragInput = inst.id
+                }
+                inst.preferredX = 0 - 1
+                caretVisible = true
+            }
+        }
+        if dragActive {
+            let call = dragFn
+            call(0, 0)
+        }
+        zuiRedraw = true
+        return
+    }
+    if kind == SDL_EVENT_MOUSE_BUTTON_UP {
+        if load8(event + 24) != 1 { return }
+        mouseDown = false
+        dragInput = 0
+        dragActive = false
+        selecting = false
+        if selActive and selAId == selBId and selAOff == selBOff { selActive = false }
+        if pressId != 0 {
+            let path = pathAt(mouseX, mouseY)
+            for el in path {
+                if el.clickable and el.inst.get().id == pressId {
+                    pressId = 0
+                    let clickFn = el.onClick
+                    clickFn()
+                    zuiDirty = true
+                    break
+                }
+            }
+        }
+        pressId = 0
+        zuiRedraw = true
+        return
+    }
+    if kind == SDL_EVENT_MOUSE_WHEEL {
+        let dy = floatAt(event + 28)
+        let path = pathAt(mouseX, mouseY)
+        var i = path.len() - 1
+        while i >= 0 {
+            let el = path[i]
+            if el.tag == Tag.Scroll {
+                let inst = el.inst.get()
+                let base = if inst.scrollTarget >= 0 { inst.scrollTarget } else { inst.scroll }
+                inst.scrollTarget = max(base - ((dy * sc(90)) as int), 0)
+                if dy > 0.0 { inst.atBottom = false }
+                zuiDirty = true
+                break
+            }
+            if el.tag == Tag.Input {
+                let inst = el.inst.get()
+                inst.scroll -= (dy * sc(48)) as int
+                zuiDirty = true
+                break
+            }
+            i -= 1
+        }
+        return
+    }
+    if kind == SDL_EVENT_KEY_DOWN {
+        let key = load32(event + 28)
+        let mods = load16(event + 32)
+        lastMods = mods
+        caretVisible = true
+        if let el = focusedInput() {
+            if inputKey(el, key, mods) {
+                zuiRedraw = true
+                return
+            }
+        }
+        if (mods & MOD_CTRL) != 0 and key == 99 and selActive {
+            let copied = selectedText()
+            if copied != "" {
+                SDL_SetClipboardText(cstr(copied))
+                return
+            }
+        }
+        if globalKeyHandler(key, mods) { zuiDirty = true }
+        return
+    }
+    if kind == SDL_EVENT_DROP_FILE {
+        let dropped = strFromC(load64(event + 40))
+        let dropFn = dropHandler
+        dropFn(dropped)
+        zuiDirty = true
+        return
+    }
+    if kind == SDL_EVENT_DROP_TEXT {
+        let dropped = strFromC(load64(event + 40))
+        if let el = focusedInput() { replaceSelection(el, dropped) }
+        return
+    }
+    if kind == SDL_EVENT_TEXT_INPUT {
+        let typed = strFromC(load64(event + 24))
+        if let el = focusedInput() { replaceSelection(el, typed) }
+        return
+    }
+}
+
+fn modState() -> int { return lastMods }
+
+// one ZUI_SCRIPT step, fed through handleEvent like real input
+fn scriptStep(event: int, verb: str, rest: str) {
+    for i in 0..16 { store64(event + 8 * i, 0) }
+    if verb == "type" {
+        store32(event, SDL_EVENT_TEXT_INPUT)
+        store64(event + 24, cstrKeep(rest.replace("\\n", "\n")))
+        handleEvent(event)
+    } else if verb == "key" {
+        let parts = rest.split(" ")
+        store32(event, SDL_EVENT_KEY_DOWN)
+        store32(event + 28, parts[0] as int)
+        store16(event + 32, if parts.len() > 1 { parts[1] as int } else { 0 })
+        handleEvent(event)
+    } else if verb == "click" or verb == "move" {
+        let parts = rest.split(" ")
+        let x = parts[0] as float
+        let y = parts[1] as float
+        store32(event, SDL_EVENT_MOUSE_MOTION)
+        store32(event + 28, float32Bits(x))
+        store32(event + 32, float32Bits(y))
+        handleEvent(event)
+        if verb == "click" {
+            store32(event, SDL_EVENT_MOUSE_BUTTON_DOWN)
+            store8(event + 24, 1)
+            store8(event + 26, 1)
+            handleEvent(event)
+            store32(event, SDL_EVENT_MOUSE_BUTTON_UP)
+            handleEvent(event)
+        }
+    } else if verb == "drag" {
+        let parts = rest.split(" ")
+        store32(event, SDL_EVENT_MOUSE_MOTION)
+        store32(event + 28, float32Bits(parts[0] as float))
+        store32(event + 32, float32Bits(parts[1] as float))
+        handleEvent(event)
+        store32(event, SDL_EVENT_MOUSE_BUTTON_DOWN)
+        store8(event + 24, 1)
+        store8(event + 26, 1)
+        handleEvent(event)
+        store32(event, SDL_EVENT_MOUSE_MOTION)
+        store32(event + 28, float32Bits(parts[2] as float))
+        store32(event + 32, float32Bits(parts[3] as float))
+        handleEvent(event)
+        store32(event, SDL_EVENT_MOUSE_BUTTON_UP)
+        handleEvent(event)
+    } else if verb == "seltext" {
+        // drag from the start of one visible string to the end of another
+        let ends = rest.split("|")
+        let from = textPointOf(ends[0], false)
+        let to = textPointOf(ends[1], true)
+        if from.0 >= 0 and to.0 >= 0 {
+            scriptStep(event, "drag", "{(from.0 / pixelScale) as int} {(from.1 / pixelScale) as int} {(to.0 / pixelScale) as int} {(to.1 / pixelScale) as int}")
+        } else {
+            print("seltext: not found: " + rest)
+        }
+    } else if verb == "drop" {
+        store32(event, SDL_EVENT_DROP_FILE)
+        store64(event + 40, cstrKeep(rest))
+        handleEvent(event)
+    } else if verb == "hover" {
+        let point = textPointOf(rest, false)
+        if point.0 >= 0 { scriptStep(event, "move", "{(point.0 / pixelScale) as int} {(point.1 / pixelScale) as int}") }
+    } else if verb == "clicktext" {
+        var needle = rest
+        if needle.len() > 1 and needle.byte(0) == 34 and needle.byte(needle.len() - 1) == 34 { needle = needle.sub(1, needle.len() - 1) }
+        var point = textPointIn(textOrder, needle, false)
+        if point.0 < 0 { point = textPointIn(allText, needle, false) }
+        if point.0 >= 0 { scriptStep(event, "drag", "{(point.0 / pixelScale) as int} {(point.1 / pixelScale) as int} {(point.0 / pixelScale) as int} {(point.1 / pixelScale) as int}") } else { print("clicktext: not found: " + needle) }
+    } else if verb == "printsel" {
+        print("selection: [" + selectedText() + "]")
+    } else if verb == "wheel" {
+        store32(event, SDL_EVENT_MOUSE_WHEEL)
+        store32(event + 28, float32Bits(rest as float))
+        handleEvent(event)
+    } else if verb == "quit" {
+        zuiQuit = true
+    }
+}
+
+// screen point of the start (or end) of `needle` in the first text element containing it
+fn textPointIn(els: [El], needle: str, atEnd: bool) -> (int, int) {
+    for el in els {
+        let content = elText(el)
+        let at = content.indexOf(needle)
+        if at < 0 { continue }
+        let offset = if atEnd { at + needle.len() } else { at }
+        let inst = el.inst.get()
+        for line in inst.lines {
+            for run in line.runs {
+                if offset >= run.lo and offset <= run.lo + run.text.len() {
+                    let x = el.x + sc(el.style.padL) + run.x + textWidthRange(run.font, run.text, 0, offset - run.lo)
+                    let y = el.y + sc(el.style.padT) + line.y + line.h / 2
+                    return (if atEnd { x - 1 } else { x + 1 }, y)
+                }
+            }
+        }
+    }
+    return (0 - 1, 0 - 1)
+}
+
+fn textPointOf(needle: str, atEnd: bool) -> (int, int) { return textPointIn(textOrder, needle, atEnd) }
+
+fn store16(address: int, value: int) {
+    store8(address, value & 255)
+    store8(address + 1, (value >> 8) & 255)
+}
+
+fn floatAt(p: int) -> float { return float32FromBits(load32(p)) }
+
+// set the app-wide shortcut handler (runs when the focused input doesn't take a key)
+fn onGlobalKey(handler: fn(int, int) -> bool) { globalKeyHandler = handler }
+
+fn copyText(content: str) { SDL_SetClipboardText(cstr(content)) }
+
+fn onDrop(handler: fn(str)) { dropHandler = handler }
+fn onPaste(handler: fn() -> bool) { pasteHandler = handler }
+
+// clipboard contents of one MIME type ("" when absent)
+fn clipboardData(mime: str) -> str {
+    if not SDL_HasClipboardData(cstr(mime)) { return "" }
+    let size = cstrIn(3, "")
+    store64(size, 0)
+    let p = SDL_GetClipboardData(cstr(mime), size)
+    if p == 0 { return "" }
+    let data = strFrom(p, load64(size))
+    SDL_free(p)
+    return data
+}

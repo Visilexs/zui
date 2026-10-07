@@ -1,0 +1,597 @@
+// The drawing layer. Everything on screen -- rectangles, anti-aliased rounded
+// corners and glyphs -- is a textured quad from one atlas texture, collected
+// into a vertex batch and drawn with a single SDL_RenderGeometry per clip
+// region. Coordinates are physical pixels.
+import "ffi.zeph"
+
+struct Glyph { x: int, y: int, w: int, h: int, left: int, top: int, advance: int }
+
+struct Font {
+    files: [str]             // fontconfig candidates, best first: [0] is the face, the rest fallbacks
+    indices: [int]           // face index inside each file (TTC collections)
+    faces: [int]             // FT_Face per candidate, 0 = not opened yet, -1 = unusable
+    size: int                // pixel size
+    logical: float = 0.0     // unrounded size, kept across zoom changes
+    ascent: int = 0
+    descent: int = 0
+    lineHeight: int = 0
+    glyphs: [int: Glyph] = [:]
+}
+
+const ATLAS_SIZE = 2048
+const BATCH_QUADS = 8192
+
+var gfxRenderer = 0
+var gfxAtlas = 0
+var gfxFreeType = 0
+var gfxFontConfig = 0
+var gfxFonts: [Font] = []
+var gfxCornerCache: [int: Glyph] = [:]
+var atlasX = 4
+var atlasY = 0
+var atlasRow = 4
+var atlasPixels = 0                  // staging buffer for one glyph upload
+var batchVertices: [f32] = []
+var batchIndices = 0
+var batchQuads = 0
+var clipStack: [(int, int, int, int)] = []
+var clipRect = 0
+var gfxWidth = 0
+var gfxHeight = 0
+var gfxAlpha = 1.0                  // multiplies every colour's alpha (fades)
+
+fn gfxInit(renderer: int) {
+    gfxRenderer = renderer
+    gfxAtlas = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGBA32, 0, ATLAS_SIZE, ATLAS_SIZE)
+    if gfxAtlas == 0 { panic("atlas texture: " + sdlError()) }
+    SDL_SetTextureBlendMode(gfxAtlas, SDL_BLENDMODE_BLEND)
+    SDL_SetTextureScaleMode(gfxAtlas, SDL_SCALEMODE_LINEAR)
+    atlasPixels = nativeAlloc(4 * 256 * 256)
+    // a 4x4 white block at the origin: solid fills sample its centre
+    for i in 0..16 { store32(atlasPixels + 4 * i, 0 - 1) }
+    uploadRegion(0, 0, 4, 4)
+    for i in 0..BATCH_QUADS * 32 { batchVertices.push(0.0) }
+    batchIndices = nativeAlloc(4 * 6 * BATCH_QUADS)
+    for q in 0..BATCH_QUADS {
+        let base = batchIndices + 24 * q
+        store32(base, 4 * q)
+        store32(base + 4, 4 * q + 1)
+        store32(base + 8, 4 * q + 2)
+        store32(base + 12, 4 * q + 2)
+        store32(base + 16, 4 * q + 1)
+        store32(base + 20, 4 * q + 3)
+    }
+    clipRect = nativeAlloc(16)
+    let library = nativeAlloc(8)
+    if FT_Init_FreeType(library) != 0 { panic("FreeType init failed") }
+    gfxFreeType = load64(library)
+    gfxFontConfig = FcInitLoadConfigAndFonts()
+}
+
+fn uploadRegion(x: int, y: int, w: int, h: int) {
+    let rect = cstrIn(7, "")           // reuse a small off-heap slot for the SDL_Rect
+    store32(rect, x)
+    store32(rect + 4, y)
+    store32(rect + 8, w)
+    store32(rect + 12, h)
+    SDL_UpdateTexture(gfxAtlas, rect, atlasPixels, 4 * w)
+}
+
+// ---- atlas packing ----
+
+fn atlasReset() {
+    flush()
+    atlasX = 4
+    atlasY = 0
+    atlasRow = 4
+    for font in gfxFonts { font.glyphs = [:] }
+    gfxCornerCache = [:]
+}
+
+// a free w x h region (with a one-pixel gutter); resets the atlas when full
+fn atlasPlace(w: int, h: int) -> (int, int) {
+    if atlasX + w + 1 > ATLAS_SIZE {
+        atlasX = 0
+        atlasY += atlasRow + 1
+        atlasRow = 0
+    }
+    if atlasY + h + 1 > ATLAS_SIZE {
+        atlasReset()
+        return atlasPlace(w, h)
+    }
+    let place = (atlasX, atlasY)
+    atlasX += w + 1
+    if h > atlasRow { atlasRow = h }
+    return place
+}
+
+// ---- fonts ----
+
+// fontconfig's sorted candidates for a pattern like "sans-serif:bold"
+fn fontOpen(pattern: str, size: int) -> int {
+    var files: [str] = []
+    var indices: [int] = []
+    let parsed = FcNameParse(cstr(pattern))
+    FcConfigSubstitute(gfxFontConfig, parsed, 0)
+    FcDefaultSubstitute(parsed)
+    let result = nativeAlloc(8)
+    let set = FcFontSort(gfxFontConfig, parsed, 1, 0, result)
+    let out = nativeAlloc(8)
+    if set != 0 {
+        let count = load32(set)
+        let patterns = load64(set + 8)
+        for i in 0..count {
+            let candidate = load64(patterns + 8 * i)
+            if FcPatternGetString(candidate, cstrIn(1, "file"), 0, out) != 0 { continue }
+            let file = strFromC(load64(out))
+            var index = 0
+            if FcPatternGetInteger(candidate, cstrIn(1, "index"), 0, out) == 0 { index = load32(out) }
+            files.push(file)
+            indices.push(index)
+            if files.len() >= 24 { break }
+        }
+    }
+    if files.len() == 0 { panic("no font found for '{pattern}'") }
+    var faces: [int] = []
+    for f in files { faces.push(0) }
+    let font = Font{files: files, indices: indices, faces: faces, size: size}
+    let primary = fontFace(font, 0)
+    if primary <= 0 { panic("cannot open font {files[0]}") }
+    let metrics = load64(primary + FT_FACE_SIZE)
+    font.ascent = (load64(metrics + FT_SIZE_ASCENDER) + 63) >> 6
+    font.descent = (0 - load64(metrics + FT_SIZE_DESCENDER) + 63) >> 6
+    font.lineHeight = font.ascent + font.descent + size / 6
+    gfxFonts.push(font)
+    return gfxFonts.len() - 1
+}
+
+fn fontFace(font: Font, slot: int) -> int {
+    if font.faces[slot] == 0 {
+        let out = nativeAlloc(8)
+        var face = 0 - 1
+        if FT_New_Face(gfxFreeType, cstr(font.files[slot]), font.indices[slot], out) == 0 {
+            face = load64(out)
+            // bitmap-only colour fonts reject arbitrary sizes: skip them
+            if FT_Set_Pixel_Sizes(face, 0, font.size) != 0 { face = 0 - 1 }
+        }
+        font.faces[slot] = face
+    }
+    return font.faces[slot]
+}
+
+fn fontMetrics(font: Font) {
+    let primary = fontFace(font, 0)
+    let metrics = load64(primary + FT_FACE_SIZE)
+    font.ascent = (load64(metrics + FT_SIZE_ASCENDER) + 63) >> 6
+    font.descent = (0 - load64(metrics + FT_SIZE_DESCENDER) + 63) >> 6
+    font.lineHeight = font.ascent + font.descent + font.size / 6
+}
+
+// re-rasterize every font at ratio × its size (the UI zoom changed)
+fn fontsRescale(ratio: float) {
+    for font in gfxFonts {
+        if font.logical == 0.0 { font.logical = font.size as float }
+        font.logical = font.logical * ratio
+        font.size = max((font.logical + 0.5) as int, 4)
+        for slot in 0..font.faces.len() {
+            let face = font.faces[slot]
+            if face > 0 and FT_Set_Pixel_Sizes(face, 0, font.size) != 0 { font.faces[slot] = 0 - 1 }
+        }
+        fontMetrics(font)
+    }
+    atlasReset()
+}
+
+fn fontLineHeight(fontId: int) -> int { return gfxFonts[fontId].lineHeight }
+fn fontAscent(fontId: int) -> int { return gfxFonts[fontId].ascent }
+
+fn glyphFor(fontId: int, codepoint: int) -> Glyph {
+    let font = gfxFonts[fontId]
+    if let cached = font.glyphs.get(codepoint) { return cached }
+    let glyph = rasterize(font, codepoint)
+    font.glyphs[codepoint] = glyph
+    return glyph
+}
+
+fn rasterize(font: Font, codepoint: int) -> Glyph {
+    var face = 0
+    var index = 0
+    for slot in 0..font.files.len() {
+        let candidate = fontFace(font, slot)
+        if candidate <= 0 { continue }
+        index = FT_Get_Char_Index(candidate, codepoint)
+        if index != 0 {
+            face = candidate
+            break
+        }
+    }
+    if face == 0 {
+        // nothing has it: the primary face's .notdef box
+        face = fontFace(font, 0)
+        index = 0
+    }
+    if FT_Load_Glyph(face, index, FT_LOAD_RENDER | FT_LOAD_TARGET_LIGHT) != 0 {
+        return Glyph{x: 0, y: 0, w: 0, h: 0, left: 0, top: 0, advance: font.size / 2}
+    }
+    let slot = load64(face + FT_FACE_GLYPH)
+    let advance = (load64(slot + FT_GLYPH_ADVANCE_X) + 32) >> 6
+    let bitmap = slot + FT_GLYPH_BITMAP
+    let rows = load32(bitmap + FT_BITMAP_ROWS)
+    let width = load32(bitmap + FT_BITMAP_WIDTH)
+    var pitch = load32(bitmap + FT_BITMAP_PITCH)
+    if pitch >= 2147483648 { pitch -= 4294967296 }
+    let buffer = load64(bitmap + FT_BITMAP_BUFFER)
+    var left = load32(slot + FT_GLYPH_LEFT)
+    if left >= 2147483648 { left -= 4294967296 }
+    var top = load32(slot + FT_GLYPH_TOP)
+    if top >= 2147483648 { top -= 4294967296 }
+    if rows == 0 or width == 0 or width > 256 or rows > 256 or load8(bitmap + FT_BITMAP_MODE) != 2 {
+        return Glyph{x: 0, y: 0, w: 0, h: 0, left: 0, top: 0, advance: advance}
+    }
+    for row in 0..rows {
+        let source = buffer + row * pitch
+        let target = atlasPixels + 4 * width * row
+        for column in 0..width {
+            store32(target + 4 * column, 16777215 | (load8(source + column) << 24))
+        }
+    }
+    let (x, y) = atlasPlace(width, rows)
+    uploadRegion(x, y, width, rows)
+    return Glyph{x: x, y: y, w: width, h: rows, left: left, top: top, advance: advance}
+}
+
+// ---- UTF-8 ----
+
+// the codepoint starting at byte i, and its length in bytes
+fn utf8At(text: str, i: int) -> (int, int) {
+    let b0 = text.byte(i)
+    if b0 < 128 { return (b0, 1) }
+    let n = text.len()
+    if b0 >= 240 and i + 3 < n {
+        return (((b0 & 7) << 18) | ((text.byte(i + 1) & 63) << 12) | ((text.byte(i + 2) & 63) << 6) | (text.byte(i + 3) & 63), 4)
+    }
+    if b0 >= 224 and i + 2 < n {
+        return (((b0 & 15) << 12) | ((text.byte(i + 1) & 63) << 6) | (text.byte(i + 2) & 63), 3)
+    }
+    if b0 >= 192 and i + 1 < n { return (((b0 & 31) << 6) | (text.byte(i + 1) & 63), 2) }
+    return (65533, 1)
+}
+
+// is byte i the start of a codepoint?
+fn utf8Boundary(text: str, i: int) -> bool {
+    if i <= 0 or i >= text.len() { return true }
+    return (text.byte(i) & 192) != 128
+}
+fn utf8Prev(text: str, i: int) -> int {
+    var j = i - 1
+    while j > 0 and not utf8Boundary(text, j) { j -= 1 }
+    return max(j, 0)
+}
+fn utf8Next(text: str, i: int) -> int {
+    var j = i + 1
+    while j < text.len() and not utf8Boundary(text, j) { j += 1 }
+    return min(j, text.len())
+}
+
+// ---- measuring ----
+
+fn charAdvance(fontId: int, codepoint: int) -> int {
+    if codepoint == 9 { return 4 * glyphFor(fontId, 32).advance }
+    return glyphFor(fontId, codepoint).advance
+}
+
+// width of text[lo..hi]
+fn textWidthRange(fontId: int, text: str, lo: int, hi: int) -> int {
+    var w = 0
+    var i = lo
+    while i < hi {
+        let (cp, n) = utf8At(text, i)
+        if cp != 10 { w += charAdvance(fontId, cp) }
+        i += n
+    }
+    return w
+}
+fn textWidth(fontId: int, text: str) -> int { return textWidthRange(fontId, text, 0, text.len()) }
+
+// ---- the batch ----
+
+fn colorR(c: int) -> float { return ((c >> 24) & 255) / 255.0 }
+fn colorG(c: int) -> float { return ((c >> 16) & 255) / 255.0 }
+fn colorB(c: int) -> float { return ((c >> 8) & 255) / 255.0 }
+fn colorA(c: int) -> float { return (c & 255) / 255.0 }
+
+fn flush() {
+    if batchQuads == 0 { return }
+    let data = load64(addr(batchVertices) + 16)
+    SDL_RenderGeometry(gfxRenderer, gfxAtlas, data, 4 * batchQuads, batchIndices, 6 * batchQuads)
+    batchQuads = 0
+}
+
+// a quad from (x0, y0) to (x1, y1) sampling atlas texels (u0, v0)-(u1, v1)
+fn quad(x0: float, y0: float, x1: float, y1: float, u0: float, v0: float, u1: float, v1: float, color: int) {
+    if batchQuads == BATCH_QUADS { flush() }
+    let r = colorR(color)
+    let g = colorG(color)
+    let b = colorB(color)
+    let a = colorA(color) * gfxAlpha
+    let s = 1.0 / ATLAS_SIZE
+    var k = 32 * batchQuads
+    for corner in 0..4 {
+        let right = (corner & 1) != 0
+        let bottom = (corner & 2) != 0
+        batchVertices[k] = if right { x1 } else { x0 }
+        batchVertices[k + 1] = if bottom { y1 } else { y0 }
+        batchVertices[k + 2] = r
+        batchVertices[k + 3] = g
+        batchVertices[k + 4] = b
+        batchVertices[k + 5] = a
+        batchVertices[k + 6] = (if right { u1 } else { u0 }) * s
+        batchVertices[k + 7] = (if bottom { v1 } else { v0 }) * s
+        k += 8
+    }
+    batchQuads += 1
+}
+
+fn fillRect(x: int, y: int, w: int, h: int, color: int) {
+    if w <= 0 or h <= 0 or (color & 255) == 0 { return }
+    quad(x, y, x + w, y + h, 1.5, 1.5, 2.5, 2.5, color)
+}
+
+// an anti-aliased quarter disc of radius r: coverage falls off towards (r, r)
+fn cornerGlyph(radius: int) -> Glyph {
+    let r = min(radius, 64)
+    if let cached = gfxCornerCache.get(r) { return cached }
+    for y in 0..r {
+        for x in 0..r {
+            var covered = 0
+            for sy in 0..4 {
+                for sx in 0..4 {
+                    let dx = r - (x + (sx + 0.5) / 4.0)
+                    let dy = r - (y + (sy + 0.5) / 4.0)
+                    if dx * dx + dy * dy <= r * r { covered += 1 }
+                }
+            }
+            store32(atlasPixels + 4 * (y * r + x), 16777215 | ((covered * 255 / 16) << 24))
+        }
+    }
+    let (ax, ay) = atlasPlace(r, r)
+    uploadRegion(ax, ay, r, r)
+    let glyph = Glyph{x: ax, y: ay, w: r, h: r, left: 0, top: 0, advance: 0}
+    gfxCornerCache[r] = glyph
+    return glyph
+}
+
+fn fillRound(x: int, y: int, w: int, h: int, radius: int, color: int) {
+    if w <= 0 or h <= 0 or (color & 255) == 0 { return }
+    let r = min(radius, min(w, h) / 2)
+    if r <= 0 {
+        fillRect(x, y, w, h, color)
+        return
+    }
+    let c = cornerGlyph(r)
+    let u0 = c.x
+    let v0 = c.y
+    let u1 = c.x + c.w
+    let v1 = c.y + c.h
+    // corners: the glyph's (0,0) is the outside, mirrored per corner
+    quad(x, y, x + r, y + r, u0, v0, u1, v1, color)
+    quad(x + w - r, y, x + w, y + r, u1, v0, u0, v1, color)
+    quad(x, y + h - r, x + r, y + h, u0, v1, u1, v0, color)
+    quad(x + w - r, y + h - r, x + w, y + h, u1, v1, u0, v0, color)
+    fillRect(x + r, y, w - 2 * r, h, color)
+    fillRect(x, y + r, r, h - 2 * r, color)
+    fillRect(x + w - r, y + r, r, h - 2 * r, color)
+}
+
+fn fillCircle(cx: int, cy: int, radius: int, color: int) {
+    fillRound(cx - radius, cy - radius, 2 * radius, 2 * radius, radius, color)
+}
+
+// a soft drop shadow: stacked translucent rounded rects, offset downwards
+fn drawShadow(x: int, y: int, w: int, h: int, radius: int, size: int) {
+    let steps = 6
+    for i in 0..steps {
+        let grow = size * (steps - i) / steps
+        let alpha = 5 + 4 * i
+        fillRound(x - grow, y - grow + size / 3, w + 2 * grow, h + 2 * grow, radius + grow, alpha)
+    }
+}
+
+// a rounded outline of `thickness` pixels (drawn as four rounded strips)
+fn strokeRound(x: int, y: int, w: int, h: int, radius: int, thickness: int, color: int) {
+    if w <= 0 or h <= 0 or (color & 255) == 0 { return }
+    let r = min(radius, min(w, h) / 2)
+    if r <= thickness {
+        fillRect(x, y, w, thickness, color)
+        fillRect(x, y + h - thickness, w, thickness, color)
+        fillRect(x, y + thickness, thickness, h - 2 * thickness, color)
+        fillRect(x + w - thickness, y + thickness, thickness, h - 2 * thickness, color)
+        return
+    }
+    let c = cornerGlyph(r)
+    let inner = r - thickness
+    // outer ring corners: the disc minus the inner disc is approximated by
+    // drawing the outer quarter and covering the inside with straight edges
+    fillRect(x + r, y, w - 2 * r, thickness, color)
+    fillRect(x + r, y + h - thickness, w - 2 * r, thickness, color)
+    fillRect(x, y + r, thickness, h - 2 * r, color)
+    fillRect(x + w - thickness, y + r, thickness, h - 2 * r, color)
+    ringCorner(x, y, r, inner, false, false, color)
+    ringCorner(x + w - r, y, r, inner, true, false, color)
+    ringCorner(x, y + h - r, r, inner, false, true, color)
+    ringCorner(x + w - r, y + h - r, r, inner, true, true, color)
+}
+
+// a quarter ring as its own anti-aliased atlas glyph, cached by (r, inner)
+fn ringCorner(x: int, y: int, r: int, inner: int, flipX: bool, flipY: bool, color: int) {
+    let key = 100000 + r * 1000 + inner
+    var glyph = Glyph{x: 0, y: 0, w: 0, h: 0, left: 0, top: 0, advance: 0}
+    if let cached = gfxCornerCache.get(key) { glyph = cached }
+    else {
+        for py in 0..r {
+            for px in 0..r {
+                var covered = 0
+                for sy in 0..4 {
+                    for sx in 0..4 {
+                        let dx = r - (px + (sx + 0.5) / 4.0)
+                        let dy = r - (py + (sy + 0.5) / 4.0)
+                        let d = dx * dx + dy * dy
+                        if d <= r * r and d >= inner * inner { covered += 1 }
+                    }
+                }
+                store32(atlasPixels + 4 * (py * r + px), 16777215 | ((covered * 255 / 16) << 24))
+            }
+        }
+        let (ax, ay) = atlasPlace(r, r)
+        uploadRegion(ax, ay, r, r)
+        glyph = Glyph{x: ax, y: ay, w: r, h: r, left: 0, top: 0, advance: 0}
+        gfxCornerCache[key] = glyph
+    }
+    let u0 = if flipX { glyph.x + r } else { glyph.x }
+    let u1 = if flipX { glyph.x } else { glyph.x + r }
+    let v0 = if flipY { glyph.y + r } else { glyph.y }
+    let v1 = if flipY { glyph.y } else { glyph.y + r }
+    quad(x, y, x + r, y + r, u0, v0, u1, v1, color)
+}
+
+// draw text[lo..hi] with its line box's top at y; returns the end x
+fn drawTextRange(fontId: int, x: int, y: int, text: str, lo: int, hi: int, color: int) -> int {
+    let baseline = y + (gfxFonts[fontId].lineHeight - gfxFonts[fontId].ascent - gfxFonts[fontId].descent) / 2 + gfxFonts[fontId].ascent
+    var pen = x
+    var i = lo
+    let clipRight = currentClipRight()
+    while i < hi {
+        let (cp, n) = utf8At(text, i)
+        i += n
+        if cp == 10 { continue }
+        if cp == 9 {
+            pen += charAdvance(fontId, 9)
+            continue
+        }
+        let g = glyphFor(fontId, cp)
+        if g.w > 0 and pen < clipRight {
+            let gx = pen + g.left
+            let gy = baseline - g.top
+            quad(gx, gy, gx + g.w, gy + g.h, g.x, g.y, g.x + g.w, g.y + g.h, color)
+        }
+        pen += g.advance
+    }
+    return pen
+}
+fn drawText(fontId: int, x: int, y: int, text: str, color: int) -> int {
+    return drawTextRange(fontId, x, y, text, 0, text.len(), color)
+}
+
+// ---- clipping ----
+
+fn currentClipRight() -> int {
+    if clipStack.len() == 0 { return gfxWidth }
+    let top = clipStack[clipStack.len() - 1]
+    return top.0 + top.2
+}
+
+fn currentClip() -> (int, int, int, int) {
+    if clipStack.len() == 0 { return (0, 0, gfxWidth, gfxHeight) }
+    return clipStack[clipStack.len() - 1]
+}
+
+fn applyClip() {
+    flush()
+    if clipStack.len() == 0 {
+        SDL_SetRenderClipRect(gfxRenderer, 0)
+        return
+    }
+    let c = clipStack[clipStack.len() - 1]
+    store32(clipRect, c.0)
+    store32(clipRect + 4, c.1)
+    store32(clipRect + 8, max(c.2, 0))
+    store32(clipRect + 12, max(c.3, 0))
+    SDL_SetRenderClipRect(gfxRenderer, clipRect)
+}
+
+// intersect with the current clip
+fn pushClip(x: int, y: int, w: int, h: int) {
+    let c = currentClip()
+    let x0 = max(x, c.0)
+    let y0 = max(y, c.1)
+    let x1 = min(x + w, c.0 + c.2)
+    let y1 = min(y + h, c.1 + c.3)
+    clipStack.push((x0, y0, max(x1 - x0, 0), max(y1 - y0, 0)))
+    applyClip()
+}
+fn popClip() {
+    let dropped = clipStack.pop()
+    applyClip()
+}
+
+fn beginFrame(width: int, height: int, background: int) {
+    gfxWidth = width
+    gfxHeight = height
+    clipStack = []
+    gfxAlpha = 1.0
+    SDL_SetRenderClipRect(gfxRenderer, 0)
+    SDL_SetRenderDrawColor(gfxRenderer, (background >> 24) & 255, (background >> 16) & 255, (background >> 8) & 255, 255)
+    SDL_RenderClear(gfxRenderer)
+}
+
+fn endFrame(screenshot: str) {
+    flush()
+    if screenshot != "" {
+        let surface = SDL_RenderReadPixels(gfxRenderer, 0)
+        if surface != 0 {
+            SDL_SaveBMP(surface, cstr(screenshot))
+            SDL_DestroySurface(surface)
+        }
+    }
+    SDL_RenderPresent(gfxRenderer)
+}
+
+// ---- images ----
+// Pictures are separate textures (not in the atlas). SDL loads BMP itself;
+// apps convert other formats first. Ids start at 1 (0: no image).
+
+struct Image { tex: int, w: int, h: int }
+
+var gfxImages: [Image] = []
+var gfxRects = 0
+
+fn imageLoadBMP(path: str) -> int {
+    let surface = SDL_LoadBMP(cstr(path))
+    if surface == 0 { return 0 }
+    let tex = SDL_CreateTextureFromSurface(gfxRenderer, surface)
+    SDL_DestroySurface(surface)
+    if tex == 0 { return 0 }
+    SDL_SetTextureScaleMode(tex, 1)                  // linear
+    let size = nativeAlloc(8)
+    SDL_GetTextureSize(tex, size, size + 4)
+    gfxImages.push(Image{tex: tex, w: float32FromBits(load32(size)) as int, h: float32FromBits(load32(size + 4)) as int})
+    return gfxImages.len()
+}
+
+fn imageSize(id: int) -> (int, int) {
+    if id <= 0 or id > gfxImages.len() { return (0, 0) }
+    let img = gfxImages[id - 1]
+    return (img.w, img.h)
+}
+
+// draw an image filling (x, y, w, h), cropped to keep its aspect (CSS
+// object-fit: cover)
+fn drawImage(id: int, x: int, y: int, w: int, h: int) {
+    if id <= 0 or id > gfxImages.len() or w <= 0 or h <= 0 { return }
+    let img = gfxImages[id - 1]
+    flush()
+    if gfxRects == 0 { gfxRects = nativeAlloc(32) }
+    let scale = max((w as float) / (img.w as float), (h as float) / (img.h as float))
+    let sw = (w as float) / scale
+    let sh = (h as float) / scale
+    store32(gfxRects, float32Bits((img.w as float - sw) / 2.0))
+    store32(gfxRects + 4, float32Bits((img.h as float - sh) / 2.0))
+    store32(gfxRects + 8, float32Bits(sw))
+    store32(gfxRects + 12, float32Bits(sh))
+    store32(gfxRects + 16, float32Bits(x as float))
+    store32(gfxRects + 20, float32Bits(y as float))
+    store32(gfxRects + 24, float32Bits(w as float))
+    store32(gfxRects + 28, float32Bits(h as float))
+    SDL_SetTextureAlphaMod(img.tex, (gfxAlpha * 255.0 + 0.5) as int)
+    let drawn = SDL_RenderTexture(gfxRenderer, img.tex, gfxRects, gfxRects + 16)
+}

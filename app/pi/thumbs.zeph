@@ -1,0 +1,155 @@
+// Pictures in the conversation: thumbnails of pasted, dropped or picked
+// images (in the composer and in sent messages), and the file picker behind
+// the paperclip. SDL only decodes BMP, so ImageMagick turns each picture into
+// a small BMP in the background; until it's ready a placeholder pulses.
+import "commands.zeph"
+
+struct Thumb { state: int = 0, proc: Proc? = none, src: str = "", out: str = "", image: int = 0 }
+
+const THUMB_CONVERTING = 0
+const THUMB_READY = 1
+const THUMB_FAILED = 2
+
+var thumbs: [str: Thumb] = [:]
+var thumbSerial = 0
+var pickerProc: Proc? = none
+var pickerPaths: [str] = []
+
+fn thumbKey(a: Attachment) -> str {
+    let n = a.data.len()
+    return "{n}:" + a.data.sub(0, min(n, 48)) + a.data.sub(max(n - 48, 0), n)
+}
+
+fn tempBase() -> str { return "/tmp/pi-desk-{syscall(39)}-" }
+
+// the image id of an attachment's thumbnail, starting the conversion the
+// first time (0 while it's converting or when it failed)
+fn thumbImage(a: Attachment) -> int {
+    let key = thumbKey(a)
+    if let t = thumbs.get(key) { return t.image }
+    thumbSerial += 1
+    let src = tempBase() + "src{thumbSerial}"
+    let out = tempBase() + "thumb{thumbSerial}.bmp"
+    var t = Thumb{src: src, out: out}
+    writeFile(src, base64Decode(a.data))
+    // the first frame, at most 640 px, flattened onto the panel colour
+    t.proc = procSpawn(["magick", src + "[0]", "-resize", "640x640>", "-background", "#1d1e21", "-alpha", "remove", "-alpha", "off", "BMP3:" + out])
+    if not t.proc.has() { t.state = THUMB_FAILED }
+    thumbs[key] = t
+    return 0
+}
+
+fn thumbState(a: Attachment) -> int {
+    if let t = thumbs.get(thumbKey(a)) { return t.state }
+    return THUMB_CONVERTING
+}
+
+fn thumbsTick() {
+    for key in thumbs.keys() {
+        let t = thumbs[key]
+        if t.state != THUMB_CONVERTING { continue }
+        if let p = t.proc {
+            let ignored = procLines(p)
+            if procPoll(p) {
+                t.image = if p.exitCode == 0 { imageLoadBMP(t.out) } else { 0 }
+                t.state = if t.image > 0 { THUMB_READY } else { THUMB_FAILED }
+                t.proc = none
+                syscall(87, cstr(t.src))             // unlink
+                syscall(87, cstr(t.out))
+                invalidate()
+            }
+        }
+    }
+    if let p = pickerProc {
+        for line in procLines(p) {
+            if line.trim() != "" { pickerPaths.push(line.trim()) }
+        }
+        if procPoll(p) {
+            if p.pending.trim() != "" { pickerPaths.push(p.pending.trim()) }
+            pickerProc = none
+            for path in pickerPaths { dropFile(path) }
+            pickerPaths = []
+            invalidate()
+        }
+    }
+}
+
+// the paperclip: pick images (or any file, which becomes an @reference)
+fn pickFiles() {
+    if pickerProc.has() { return }
+    pickerPaths = []
+    // without the desktop portal the dialog is zenity's own window, so it
+    // opens inside pi-desk's app frame (and faster)
+    pickerProc = procSpawn(["env", "GDK_DEBUG=no-portals", "GTK_USE_PORTAL=0", "zenity", "--file-selection", "--multiple", "--separator=\n", "--title=Attach to the prompt",
+        "--filename=" + S.cwd + "/", "--file-filter=Images | *.png *.jpg *.jpeg *.gif *.webp *.PNG *.JPG *.JPEG", "--file-filter=All files | *"])
+    if not pickerProc.has() { toast("Install zenity for a file picker — or paste images with Ctrl+V, or drag them in", "warning") }
+}
+
+// open the full picture in the system viewer (it lands in the app frame)
+fn openImage(a: Attachment) {
+    thumbSerial += 1
+    let ext = if a.mime == "image/jpeg" { "jpg" } else if a.mime == "image/gif" { "gif" } else if a.mime == "image/webp" { "webp" } else { "png" }
+    let path = tempBase() + "view{thumbSerial}." + ext
+    writeFile(path, base64Decode(a.data))
+    let p = procSpawn(["xdg-open", path])
+    if not p.has() { toast("Couldn't open the image", "error") }
+}
+
+// a picture at most maxW × maxH, keeping its aspect once known
+fn thumbView(a: Attachment, maxW: int, maxH: int, onClick: fn()) -> El {
+    let id = thumbImage(a)
+    if id > 0 {
+        let (iw, ih) = imageSize(id)
+        var w = maxW
+        var h = if iw > 0 { ih * maxW / iw } else { maxH }
+        if h > maxH {
+            h = maxH
+            w = if ih > 0 { iw * maxH / ih } else { maxW }
+        }
+        return withTip(clickable(st().w(max(w, 24)).h(max(h, 24)).round(10).outline(0xffffff14, 1), [imageView(st().w(max(w, 24)).h(max(h, 24)).outline(0xffffff14, 1), id)], onClick), "Open " + a.name)
+    }
+    if thumbState(a) == THUMB_FAILED {
+        return box(st().row().alignTo(CENTER).gapOf(8).padXY(12, 8).round(10).fill(C_PANEL_HI), [iconSmall(I_IMAGE, C_INFO), label(a.name, F_SMALL, C_MUTED)])
+    }
+    return skeleton(min(maxW, 160), min(maxH, 110))
+}
+
+// a square tile for the composer, with a remove button on hover
+fn attachmentTile(a: Attachment, onRemove: fn()) -> El {
+    let id = thumbImage(a)
+    var inner: El = skeleton(64, 64)
+    if id > 0 { inner = imageView(st().w(64).h(64).outline(0xffffff1a, 1), id) }
+    else if thumbState(a) == THUMB_FAILED { inner = box(st().w(64).h(64).fill(C_PANEL_HI).alignTo(CENTER).justifyTo(CENTER), [icon(I_IMAGE, C_INFO)]) }
+    let remove = withHoverOnly(box(st().at(0 - 1, 3, 3, 0 - 1), [
+        withTip(clickable(st().w(20).h(20).round(10).fill(0x000000b0).hover(0x000000e0).alignTo(CENTER).justifyTo(CENTER), [inkIcon(I_TIMES, F_ICON_SMALL, C_TEXT, 20)], onRemove), "Remove")
+    ]))
+    return asHoverGroup(presence("att-" + thumbKey(a), ENTER_RISE, box(st().w(64).h(64), [inner, remove])))
+}
+
+// ---- base64 ----
+
+fn base64Value(b: int) -> int {
+    if b >= 65 and b <= 90 { return b - 65 }
+    if b >= 97 and b <= 122 { return b - 71 }
+    if b >= 48 and b <= 57 { return b + 4 }
+    if b == 43 or b == 45 { return 62 }
+    if b == 47 or b == 95 { return 63 }
+    return 0 - 1
+}
+
+fn base64Decode(text: str) -> str {
+    var out: [u8] = []
+    var acc = 0
+    var bits = 0
+    for i in 0..text.len() {
+        let v = base64Value(text.byte(i))
+        if v < 0 { continue }                  // padding, newlines
+        acc = ((acc << 6) | v) & 16777215
+        bits += 6
+        if bits >= 8 {
+            bits -= 8
+            out.push((acc >> bits) & 255)
+        }
+    }
+    return out as str
+}

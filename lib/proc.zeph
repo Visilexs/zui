@@ -1,0 +1,178 @@
+// A child process with piped stdin/stdout/stderr. Spawning uses libc's
+// posix_spawnp; reads are non-blocking raw syscalls, so the UI loop can poll
+// them between events without threads.
+import "ffi.zeph"
+
+struct Proc {
+    pid: int
+    stdinFd: int
+    stdoutFd: int
+    stderrFd: int
+    pending: str = ""
+    errTail: str = ""
+    stdoutOpen: bool = true
+    exited: bool = false
+    exitCode: int = 0
+}
+
+const O_CLOEXEC = 524288
+const O_NONBLOCK = 2048
+const EAGAIN = -11
+const EINTR = -4
+
+var procReadBuffer = 0
+var procStatus = 0
+var procTracked: [int: bool] = [:]        // children a Proc waits for itself
+
+fn procPipe() -> (int, int) {
+    let fds = nativeAlloc(8)
+    if syscall(293, fds, O_CLOEXEC) != 0 { panic("pipe2 failed") }
+    return (load32(fds), load32(fds + 4))
+}
+
+fn procEnviron() -> int {
+    let dlsymFn = load64(dynamicImport(1))
+    let variable = callSysV(dlsymFn, 0, cstr("environ"))
+    if variable == 0 { return 0 }
+    return load64(variable)
+}
+
+// start argv[0] (searched on PATH) with the given arguments
+fn procSpawn(argv: [str]) -> Proc? {
+    signal(13, 1)                               // SIGPIPE: ignore; a dead child shows up as EPIPE
+    let (inRead, inWrite) = procPipe()
+    let (outRead, outWrite) = procPipe()
+    let (errRead, errWrite) = procPipe()
+    let actions = nativeAlloc(256)
+    posix_spawn_file_actions_init(actions)
+    posix_spawn_file_actions_adddup2(actions, inRead, 0)
+    posix_spawn_file_actions_adddup2(actions, outWrite, 1)
+    posix_spawn_file_actions_adddup2(actions, errWrite, 2)
+    let vector = nativeAlloc(8 * (argv.len() + 1))
+    for i, arg in argv { store64(vector + 8 * i, cstrKeep(arg)) }
+    store64(vector + 8 * argv.len(), 0)
+    let pidOut = nativeAlloc(8)
+    let rc = posix_spawnp(pidOut, load64(vector), actions, 0, vector, procEnviron())
+    syscall(3, inRead)
+    syscall(3, outWrite)
+    syscall(3, errWrite)
+    if rc != 0 {
+        syscall(3, inWrite)
+        syscall(3, outRead)
+        syscall(3, errRead)
+        return none
+    }
+    syscall(72, outRead, 4, O_NONBLOCK)         // fcntl F_SETFL
+    syscall(72, errRead, 4, O_NONBLOCK)
+    if procReadBuffer == 0 { procReadBuffer = nativeAlloc(65536) }
+    procTracked[load32(pidOut)] = true
+    return Proc{pid: load32(pidOut), stdinFd: inWrite, stdoutFd: outRead, stderrFd: errRead}
+}
+
+// whatever is available now, without blocking; "" when nothing
+fn procDrain(fd: int, open: bool) -> (str, bool) {
+    if not open { return ("", false) }
+    var parts: [str] = []
+    var stillOpen = true
+    while true {
+        let n = syscall(0, fd, procReadBuffer, 65536)
+        if n == EINTR { continue }
+        if n == EAGAIN { break }
+        if n <= 0 {
+            stillOpen = false
+            break
+        }
+        parts.push(strFrom(procReadBuffer, n))
+        if parts.len() > 256 { break }           // let the UI breathe on a flood
+    }
+    if parts.len() == 1 { return (parts[0], stillOpen) }
+    return (parts.join(), stillOpen)
+}
+
+// complete stdout lines read so far (LF-separated, CR stripped)
+fn procLines(p: Proc) -> [str] {
+    var lines: [str] = []
+    let (chunk, open) = procDrain(p.stdoutFd, p.stdoutOpen)
+    p.stdoutOpen = open
+    let (errChunk, errOpen) = procDrain(p.stderrFd, true)
+    if errChunk != "" {
+        var tail = p.errTail + errChunk
+        if tail.len() > 8192 { tail = tail.sub(tail.len() - 8192, tail.len()) }
+        p.errTail = tail
+    }
+    if chunk == "" { return lines }
+    let data = p.pending + chunk
+    var start = 0
+    for i in 0..data.len() {
+        if data.byte(i) == 10 {
+            var end = i
+            if end > start and data.byte(end - 1) == 13 { end -= 1 }
+            lines.push(data.sub(start, end))
+            start = i + 1
+        }
+    }
+    p.pending = data.sub(start, data.len())
+    return lines
+}
+
+fn procWrite(p: Proc, text: str) -> bool {
+    var offset = 0
+    let base = strData(text)
+    while offset < text.len() {
+        let n = syscall(1, p.stdinFd, base + offset, text.len() - offset)
+        if n == EINTR { continue }
+        if n <= 0 { return false }
+        offset += n
+    }
+    return true
+}
+
+// has it exited? (reaps it)
+fn procPoll(p: Proc) -> bool {
+    if p.exited { return true }
+    if procStatus == 0 { procStatus = nativeAlloc(8) }
+    let status = procStatus
+    let r = syscall(61, p.pid, status, 1, 0)    // wait4 WNOHANG
+    if r == p.pid {
+        procTracked.remove(p.pid)
+        p.exited = true
+        let s = load32(status)
+        p.exitCode = if (s & 127) == 0 { (s >> 8) & 255 } else { 128 + (s & 127) }
+        return true
+    }
+    return false
+}
+
+fn procCloseInput(p: Proc) {
+    if p.stdinFd >= 0 {
+        syscall(3, p.stdinFd)
+        p.stdinFd = 0 - 1
+    }
+}
+
+fn procKill(p: Proc) {
+    if not p.exited { syscall(62, p.pid, 15) }
+}
+
+// Become a child subreaper (prctl PR_SET_CHILD_SUBREAPER): processes our
+// children leave behind (`cmd &` from a shell that then exits, daemons that
+// double-fork) are re-parented to us instead of to init or systemd, so they
+// still count as ours. We then have to reap them: see procReapAdopted.
+fn procBecomeSubreaper() -> bool { return syscall(157, 36, 1, 0, 0, 0) == 0 }
+
+// reap adopted processes that have exited (never the ones a Proc waits for)
+fn procReapAdopted() {
+    if procStatus == 0 { procStatus = nativeAlloc(8) }
+    if procReadBuffer == 0 { procReadBuffer = nativeAlloc(65536) }
+    let me = syscall(39)
+    let fd = syscall(2, cstr("/proc/{me}/task/{me}/children"), 0)
+    if fd < 0 { return }
+    let n = syscall(0, fd, procReadBuffer, 65536)
+    syscall(3, fd)
+    if n <= 0 { return }
+    for word in strFrom(procReadBuffer, n).trim().split(" ") {
+        if word == "" { continue }
+        let pid = word as int
+        if pid > 0 and not procTracked.has(pid) { let r = syscall(61, pid, procStatus, 1, 0) }
+    }
+}

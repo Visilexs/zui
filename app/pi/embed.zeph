@@ -1,0 +1,540 @@
+// In-app windows: windows opened by anything pi-desk started (pi, its shell
+// commands, a game, a browser...) appear in a movable, resizable frame inside
+// pi-desk instead of landing in the desktop layout. Wayland has no way to put one client's window inside
+// another's, so on Hyprland the compositor does it: a Lua hook catches the
+// window before it maps (by walking its process's parents up to pi-desk),
+// floats it so it never enters the tiled layout, then places it exactly over
+// the frame and keeps it there as pi-desk moves, resizes or changes workspace.
+import "view.zeph"
+import "../../lib/hypr.zeph"
+
+struct AppWin { address: str, class: str, title: str }
+
+var apps: [AppWin] = []
+var appsActive = ""
+var appsShown = false
+var appsMax = false
+// the frame, in logical units (fw = 0: not placed yet)
+var appsX = 0
+var appsY = 0
+var appsW = 0
+var appsH = 0
+var appsDragFrom: [int] = [0, 0, 0, 0]  // the frame when a drag started
+// anchoring: dragged near an edge or corner, the frame sticks there as the
+// window resizes. horizontal 0 free, 1 left, 2 right; vertical 0 free,
+// 1 top, 2 bottom
+var appsAnchorH = 2
+var appsAnchorV = 1
+var appsAnchorMenu = false
+var appsLoaded = false
+var appsUnsaved = false
+const APPS_MARGIN = 12
+const APPS_TOP = 72                  // below the header
+const APPS_SNAP = 32
+var appsAvailable = true
+var appsInstalled = false
+var appsLastPoll = 0
+var appsSent = ""
+var appsExcluded: [int] = []
+var appsFirstSeen: [str: int] = [:]  // address -> when it showed up (the loading spinner)
+const APPS_LOADING_MS = 4000
+
+// %PID% is pi-desk's pid; piDesk[pid] is this instance's state in Hyprland
+const EMBED_LUA = r"""
+piDesk = piDesk or {}
+do
+local PID = %PID%
+local old = piDesk[PID]
+if old then old.stop(true) end
+local D = {wins = {}, opened = {}, styled = {}, order = {}, excl = {}, rect = nil, active = nil, fresh = false, last = "", subs = {}}
+piDesk[PID] = D
+local function d(x) hl.dispatch(x) end
+local function ppid(p)
+  local f = io.open("/proc/" .. p .. "/stat")
+  if not f then return 0 end
+  local s = f:read("l") or ""
+  f:close()
+  return tonumber(s:match(".*%) %S+ (%d+)")) or 0
+end
+local function ours(p)
+  if not p or p <= 1 or p == PID then return false end
+  local n = 0
+  while p > 1 and n < 64 do
+    if D.excl[p] then return false end
+    if p == PID then return true end
+    p = ppid(p)
+    n = n + 1
+  end
+  return false
+end
+local function me()
+  local w = D.selfw and hl.get_window("address:" .. D.selfw)
+  if w and w.pid == PID then return w end
+  for _, c in ipairs(hl.get_windows()) do
+    if c.pid == PID and c.mapped then D.selfw = c.address return c end
+  end
+end
+local function win(a) return hl.get_window("address:" .. a) end
+-- hidden windows float far off-screen (a special workspace would get shown,
+-- dimming the desktop, whenever one of them took focus)
+local function hide(w)
+  if not w.floating then d(hl.dsp.window.float({action = "enable", window = w})) end
+  if w.at.x > -20000 then d(hl.dsp.window.move({x = -30000, y = -30000, window = w})) end
+end
+local function place()
+  local m = me()
+  local r = D.rect
+  for _, a in ipairs(D.order) do
+    local w = win(a)
+    if w then
+      if a == D.active and r and m and m.workspace and not m.hidden then
+        local ws = m.workspace.special and m.workspace.name or m.workspace.id
+        if not w.workspace or w.workspace.id ~= m.workspace.id then
+          d(hl.dsp.window.move({workspace = ws, follow = false, window = w}))
+        end
+        if not w.floating then d(hl.dsp.window.float({action = "enable", window = w})) end
+        if not D.styled[a] then
+          D.styled[a] = true
+          for _, pv in ipairs({{"no_anim", 1}, {"border_size", 0}, {"no_shadow", 1}, {"rounding", 8}}) do
+            d(hl.dsp.window.set_prop({prop = pv[1], value = pv[2], window = w}))
+          end
+        end
+        if w.fullscreen ~= 0 then d(hl.dsp.window.fullscreen_state({internal = 0, client = 0, window = w})) end
+        local sx, sy = m.size.x / r[5], m.size.y / r[6]
+        d(hl.dsp.window.resize({x = math.floor(r[3] * sx + 0.5), y = math.floor(r[4] * sy + 0.5), window = w}))
+        d(hl.dsp.window.move({x = m.at.x + math.floor(r[1] * sx + 0.5), y = m.at.y + math.floor(r[2] * sy + 0.5), window = w}))
+        d(hl.dsp.window.alter_zorder({mode = "top", window = w}))
+      else
+        hide(w)
+      end
+    end
+  end
+end
+local function forget(a)
+  if not D.wins[a] then return end
+  D.wins[a] = nil
+  D.opened[a] = nil
+  D.styled[a] = nil
+  for i, x in ipairs(D.order) do if x == a then table.remove(D.order, i) break end end
+  if D.active == a then D.active = D.order[#D.order] end
+  D.last = ""
+end
+table.insert(D.subs, hl.on("window.open_early", function(w)
+  if w and not D.wins[w.address] and ours(w.pid) then
+    D.wins[w.address] = true
+    table.insert(D.order, w.address)
+  end
+end))
+-- floating it during the rule pass, before it maps, keeps it out of the
+-- tiled layout entirely
+table.insert(D.subs, hl.on("window.update_rules", function(w)
+  if w and D.wins[w.address] and not D.opened[w.address] then hide(w) end
+end))
+table.insert(D.subs, hl.on("window.open", function(w)
+  if w and D.wins[w.address] then
+    D.opened[w.address] = true
+    D.active = w.address
+    D.fresh = true
+    D.last = ""
+  end
+end))
+table.insert(D.subs, hl.on("window.close", function(w) if w then forget(w.address) end end))
+table.insert(D.subs, hl.on("window.destroy", function(w) if w then forget(w.address) end end))
+table.insert(D.subs, hl.on("window.active", function(w)
+  if w and w.address == D.selfw then D.last = "" end
+end))
+D.timer = hl.timer(function()
+  local alive = io.open("/proc/" .. PID .. "/stat")
+  if not alive then D.stop() return end
+  alive:close()
+  if #D.order == 0 then return end
+  local m = me()
+  local key = "-"
+  if m and m.workspace then
+    key = m.at.x .. "," .. m.at.y .. "," .. m.size.x .. "," .. m.size.y .. "," .. m.workspace.id .. "," .. m.fullscreen .. "," .. tostring(m.hidden)
+  end
+  if key ~= D.last then
+    D.last = key
+    place()
+  end
+end, {timeout = 100, type = "repeat"})
+function D.sync(x, y, w, h, pw, ph, active)
+  D.rect = (w > 0 and h > 0) and {x, y, w, h, pw, ph} or nil
+  if active ~= "" and D.wins[active] then D.active = active end
+  D.last = ""
+  place()
+end
+function D.exclude(p) D.excl[p] = true end
+function D.list()
+  local out = {(D.fresh and "fresh" or "-") .. "\t" .. (D.active or "")}
+  D.fresh = false
+  for _, a in ipairs(D.order) do
+    local w = win(a)
+    if w then
+      table.insert(out, a .. "\t" .. (w.class or ""):gsub("[\t\n]", " ") .. "\t" .. (w.title or ""):gsub("[\t\n]", " "))
+    end
+  end
+  return table.concat(out, "\n")
+end
+function D.close(a)
+  local w = win(a)
+  if w then d(hl.dsp.window.close({window = w})) end
+end
+-- back to an ordinary tiled window next to pi-desk
+function D.release(a)
+  local w = win(a)
+  local m = me()
+  forget(a)
+  if w then
+    local ws = m and m.workspace and m.workspace.id or hl.get_active_workspace().id
+    d(hl.dsp.window.move({workspace = ws, follow = false, window = w}))
+    d(hl.dsp.window.float({action = "disable", window = w}))
+  end
+end
+-- when pi-desk goes, its windows go with it (left behind they'd be stuck
+-- hidden, or land in the layout)
+function D.stop(replaced)
+  for _, s in ipairs(D.subs) do s:remove() end
+  if D.timer then D.timer:set_enabled(false) end
+  if not replaced then
+    local left = {table.unpack(D.order)}
+    for _, a in ipairs(left) do D.close(a) end
+    -- anything still open (asking to save, say) comes back on screen
+    hl.timer(function()
+      for _, a in ipairs(left) do
+        local w = win(a)
+        if w then
+          local ws = hl.get_active_workspace()
+          if ws then d(hl.dsp.window.move({workspace = ws.id, follow = false, window = w})) end
+          d(hl.dsp.window.center({window = w}))
+        end
+      end
+    end, {timeout = 1500, type = "oneshot"})
+  end
+  piDesk[PID] = nil
+end
+end
+return "ok"
+"""
+
+fn appsCall(code: str) -> str {
+    return hyprLua("local D = piDesk and piDesk[{syscall(39)}] if not D then return 'gone' end " + code)
+}
+
+fn appsInstall() {
+    appsInstalled = true
+    if hyprSocket() == "" {
+        appsAvailable = false
+        return
+    }
+    let reply = hyprLua(EMBED_LUA.replace("%PID%", "{syscall(39)}"))
+    if reply != "ok" {
+        appsAvailable = false
+        if reply != "" { print("pi-desk: couldn't set up window embedding: " + reply) }
+        return
+    }
+    appsSent = ""
+    for p in appsExcluded { let r = appsCall("D.exclude({p})") }
+}
+
+// processes whose windows stay normal windows (the terminal and editor
+// pi-desk opens on purpose)
+fn appsExclude(pid: int) {
+    appsExcluded.push(pid)
+    if appsInstalled and appsAvailable { let r = appsCall("D.exclude({pid})") }
+}
+
+fn findKeyed(el: El, key: str) -> El? {
+    if el.key == key { return el }
+    for c in el.children {
+        if let found = findKeyed(c, key) { return found }
+    }
+    return none
+}
+
+fn appsTick() {
+    if not appsInstalled { appsInstall() }
+    if not appsAvailable { return }
+    let now = nowMs()
+    if now - appsLastPoll >= 250 {
+        appsLastPoll = now
+        let reply = appsCall("return D.list()")
+        if reply == "gone" {
+            appsInstall()                // Hyprland reloaded its Lua state
+            return
+        }
+        if reply == "" { return }
+        let lines = reply.split("\n")
+        let head = lines[0].split("\t")
+        var list: [AppWin] = []
+        for i in 1..lines.len() {
+            let f = lines[i].split("\t")
+            if f.len() >= 3 { list.push(AppWin{address: f[0], class: f[1], title: f[2]}) }
+        }
+        let active = if head.len() > 1 { head[1] } else { "" }
+        var changed = list.len() != apps.len() or active != appsActive
+        if not changed {
+            for i, a in list {
+                if a.address != apps[i].address or a.title != apps[i].title { changed = true }
+            }
+        }
+        if head[0] == "fresh" {
+            appsShown = true
+            changed = true
+        }
+        if changed {
+            apps = list
+            appsActive = active
+            if apps.len() == 0 { appsShown = false }
+            invalidate()
+        }
+    }
+    // the loading spinner stops once a window has had time to map, so an
+    // idle frame doesn't redraw every frame behind the app
+    let now2 = nowMs()
+    for a in apps {
+        if not appsFirstSeen.has(a.address) { appsFirstSeen[a.address] = now2 }
+        let age = now2 - appsFirstSeen[a.address]
+        if age >= APPS_LOADING_MS and age < APPS_LOADING_MS + 300 { invalidate() }
+    }
+    if appsUnsaved and not mouseDown { appsSave() }
+    appsSync()
+}
+
+fn appsFrameFile() -> str { return envVar("HOME") + "/.config/pi-desk/apps-frame" }
+
+fn appsLoad() {
+    appsLoaded = true
+    let path = appsFrameFile()
+    if not isFile(path) { return }
+    let f = readFile(path).trim().split(" ")
+    if f.len() < 6 { return }
+    appsW = f[0] as int
+    appsH = f[1] as int
+    appsX = f[2] as int
+    appsY = f[3] as int
+    appsAnchorH = f[4] as int
+    appsAnchorV = f[5] as int
+}
+
+fn appsSave() {
+    appsUnsaved = false
+    syscall(83, cstr(envVar("HOME") + "/.config"), 493)          // mkdir 0755
+    syscall(83, cstr(envVar("HOME") + "/.config/pi-desk"), 493)
+    writeFile(appsFrameFile(), "{appsW} {appsH} {appsX} {appsY} {appsAnchorH} {appsAnchorV}\n")
+}
+
+fn appsSetAnchor(h: int, v: int) {
+    appsAnchorH = h
+    appsAnchorV = v
+    appsAnchorMenu = false
+    appsMax = false
+    appsUnsaved = true
+}
+
+// snap to whichever edges the frame was dragged close to
+fn appsSnap() {
+    appsAnchorH = if appsX <= APPS_MARGIN + APPS_SNAP { 1 } else if appsX + appsW >= viewW - APPS_MARGIN - APPS_SNAP { 2 } else { 0 }
+    appsAnchorV = if appsY <= APPS_TOP + APPS_SNAP { 1 } else if appsY + appsH >= viewH - APPS_MARGIN - APPS_SNAP { 2 } else { 0 }
+}
+
+// tell Hyprland where the frame's window area is (in window pixels), or that
+// it's hidden
+fn appsSync() {
+    var msg = "0,0,0,0,1,1"
+    let shown = appsShownNow() and S.panel == "" and S.dialog.isNull()
+    if shown {
+        if let root = zuiRoot {
+            if let area = findKeyed(root, "apps-area") {
+                let size = nativeAlloc(8)
+                SDL_GetWindowSizeInPixels(zuiWindow, size, size + 4)
+                msg = "{area.x},{area.y},{area.w},{area.h},{load32(size)},{load32(size + 4)}"
+            }
+        }
+    }
+    if msg == appsSent { return }
+    appsSent = msg
+    let r = appsCall("D.sync({msg}, '{appsActive}')")
+}
+
+fn appsQuit() {
+    if appsInstalled and appsAvailable { let r = appsCall("D.stop()") }
+}
+
+fn appsCount() -> int { return apps.len() }
+fn appsShownNow() -> bool { return appsShown and apps.len() > 0 }
+
+fn appsToggle() {
+    appsShown = not appsShown
+    invalidate()
+}
+
+fn appName(a: AppWin) -> str {
+    if a.title != "" { return a.title }
+    if a.class != "" { return a.class }
+    return "Window"
+}
+
+// a glyph for the app, guessed from its window class
+fn appGlyph(a: AppWin) -> str {
+    let c = a.class.lower()
+    if c.contains("firefox") or c.contains("librewolf") or c.contains("zen") { return I_FIREFOX }
+    if c.contains("chrom") or c.contains("brave") or c.contains("vivaldi") { return I_CHROME }
+    if c.contains("kitty") or c.contains("term") or c.contains("alacritty") or c.contains("foot") or c.contains("ghostty") { return I_TERMINAL }
+    if c.contains("steam") or c.contains("game") or c.contains("minecraft") or c.contains("java") or c.contains("zephyr-mc") { return I_GAMEPAD }
+    if c.contains("code") or c.contains("zed") or c.contains("nvim") { return I_CODE }
+    return I_WIN_RESTORE
+}
+
+fn appActive() -> AppWin {
+    for a in apps {
+        if a.address == appsActive { return a }
+    }
+    return if apps.len() > 0 { apps[0] } else { AppWin{address: "", class: "", title: ""} }
+}
+
+var appsLastPress = 0
+
+fn appsTab(a: AppWin, many: bool) -> El {
+    let on = a.address == appsActive
+    let address = a.address
+    var parts: [El] = [
+        iconSmall(appGlyph(a), if on { C_ACCENT_HI } else { C_FAINT }),
+        label(truncate(appName(a), if many { 22 } else { 56 }), F_SMALL, if on { C_TEXT } else { C_MUTED })
+    ]
+    if many {
+        parts.push(withHoverOnly(clickable(st().w(18).h(18).round(5).alignTo(CENTER).justifyTo(CENTER).hover(C_PANEL_TOP), [iconSmall(I_TIMES, C_FAINT)], fn() {
+            let r = appsCall("D.close('{address}')")
+            appsLastPoll = 0
+        })))
+    }
+    let tab = clickable(st().row().alignTo(CENTER).gapOf(7).padTo(9, 4, if many { 4 } else { 10 }, 4).round(7).fill(if on { C_PANEL_HI } else { 0 }).hover(if on { C_PANEL_HI } else { C_PANEL }), parts, fn() {
+        appsActive = address
+        appsSent = ""
+    })
+    return withKey(asHoverGroup(tab), address)
+}
+
+// where the frame goes, in logical units
+fn appsRect() -> (int, int, int, int) {
+    if not appsLoaded { appsLoad() }
+    if appsW == 0 {
+        appsW = max(viewW * 45 / 100, 360)
+        appsH = max(viewH * 60 / 100, 260)
+    }
+    appsW = min(max(appsW, 320), viewW)
+    appsH = min(max(appsH, 200), viewH)
+    if appsAnchorH == 1 { appsX = APPS_MARGIN } else if appsAnchorH == 2 { appsX = viewW - appsW - APPS_MARGIN }
+    if appsAnchorV == 1 { appsY = APPS_TOP } else if appsAnchorV == 2 { appsY = viewH - appsH - APPS_MARGIN }
+    appsX = min(max(appsX, 0), viewW - appsW)
+    appsY = min(max(appsY, 0), viewH - appsH)
+    if appsMax { return (8, 8, viewW - 16, viewH - 16) }
+    return (appsX, appsY, appsW, appsH)
+}
+
+fn appsFrameView() -> [El] {
+    if apps.len() == 0 { return [] }
+    if not appsShown { return [appsPill()] }
+    let (x, y, w, h) = appsRect()
+    let many = apps.len() > 1
+    var tabRow: [El] = []
+    for a in apps { tabRow.push(appsTab(a, many)) }
+    let current = appsActive
+    let anchored = appsAnchorH != 0 or appsAnchorV != 0
+    let title = draggable(st().row().alignTo(CENTER).gapOf(2).padTo(6, 5, 6, 5), [
+        box(st().row().flex(1).gapOf(3).clipped(), tabRow),
+        withTip(iconBtnSmall(I_PIN, "Anchor", if appsAnchorMenu { C_ACCENT_HI } else if anchored { C_MUTED } else { C_FAINT }, fn() { appsAnchorMenu = not appsAnchorMenu }), if anchored { "Anchored " + appsAnchorName().lower() } else { "Anchor to a corner" }),
+        iconBtnSmall(I_WIN_MIN, "Minimize", C_MUTED, fn() { appsShown = false }),
+        iconBtnSmall(if appsMax { I_WIN_RESTORE } else { I_WIN_MAX }, if appsMax { "Restore" } else { "Maximize" }, C_MUTED, fn() { appsMax = not appsMax }),
+        iconBtnSmall(I_EXTERNAL, "Move to the desktop", C_MUTED, fn() {
+            let r = appsCall("D.release('{current}')")
+            appsLastPoll = 0
+        }),
+        iconBtnSmall(I_TIMES, "Close window", C_MUTED, fn() {
+            let r = appsCall("D.close('{current}')")
+            appsLastPoll = 0
+        })
+    ], fn(dx: int, dy: int) {
+        if dx == 0 and dy == 0 {
+            // a double click on the bar maximizes, like a desktop title bar
+            let now = nowMs()
+            if now - appsLastPress < 350 { appsMax = not appsMax }
+            appsLastPress = now
+            appsDragFrom = [appsX, appsY, appsW, appsH]
+            return
+        }
+        if appsMax { return }
+        appsX = appsDragFrom[0] + dx
+        appsY = appsDragFrom[1] + dy
+        appsSnap()
+        appsUnsaved = true
+    })
+    // the app's own window is glued over this box; until it maps, a spinner
+    let active = appActive()
+    let loading = nowMs() - appsFirstSeen.get(active.address).or(nowMs()) < APPS_LOADING_MS
+    let area = withKey(box(st().flex(1).round(8).fill(C_CODE_BG).alignTo(CENTER).justifyTo(CENTER).gapOf(10), [
+        if loading { spinner(22, C_ACCENT) } else { icon(appGlyph(active), C_FAINT) },
+        label((if loading { "Opening " } else { "" }) + truncate(appName(active), 40) + (if loading { "…" } else { "" }), F_SMALL, C_FAINT)
+    ]), "apps-area")
+    var parts: [El] = [title]
+    if appsAnchorMenu {
+        parts.push(presence("apps-anchor", ENTER_DROP, box(st().row().alignTo(CENTER).gapOf(10).padTo(10, 0, 10, 6), [
+            label("Anchor", F_SMALL, C_FAINT),
+            tabs(["Top left", "Top right", "Bottom left", "Bottom right", "Free"], appsAnchorName(), fn(v: str) {
+                if v == "Top left" { appsSetAnchor(1, 1) }
+                else if v == "Top right" { appsSetAnchor(2, 1) }
+                else if v == "Bottom left" { appsSetAnchor(1, 2) }
+                else if v == "Bottom right" { appsSetAnchor(2, 2) }
+                else { appsSetAnchor(0, 0) }
+            })
+        ])))
+    }
+    parts.push(box(st().flex(1).padTo(5, 0, 5, 5), [area]))
+    if not appsMax {
+        for grip in resizeHandles(RESIZE_LEFT | RESIZE_RIGHT | RESIZE_TOP | RESIZE_BOTTOM, fn(edges: int, dx: int, dy: int) { appsResize(edges, dx, dy) }) { parts.push(grip) }
+    }
+    let frame = box(st().at(x, y, 0 - 1, 0 - 1).w(w).h(h).fill(C_SIDEBAR).round(12).outline(0xffffff14, 1).shadowed(28).clipped(), parts)
+    return [presence("apps-frame", ENTER_RISE, frame)]
+}
+
+// resizing from any edge or corner; the frame re-anchors to wherever it ends up
+fn appsResize(edges: int, dx: int, dy: int) {
+    if dx == 0 and dy == 0 {
+        appsDragFrom = [appsX, appsY, appsW, appsH]
+        return
+    }
+    let from = appsDragFrom
+    if (edges & RESIZE_LEFT) != 0 {
+        appsW = max(from[2] - dx, 320)
+        appsX = from[0] + from[2] - appsW
+    }
+    if (edges & RESIZE_RIGHT) != 0 { appsW = max(from[2] + dx, 320) }
+    if (edges & RESIZE_TOP) != 0 {
+        appsH = max(from[3] - dy, 200)
+        appsY = from[1] + from[3] - appsH
+    }
+    if (edges & RESIZE_BOTTOM) != 0 { appsH = max(from[3] + dy, 200) }
+    appsSnap()
+    appsUnsaved = true
+}
+
+fn appsAnchorName() -> str {
+    if appsAnchorH == 0 or appsAnchorV == 0 { return "Free" }
+    return (if appsAnchorV == 1 { "Top" } else { "Bottom" }) + (if appsAnchorH == 1 { " left" } else { " right" })
+}
+
+// the minimized frame: a pill in its corner that brings it back
+fn appsPill() -> El {
+    let a = appActive()
+    let right = appsAnchorH != 1
+    let bottom = appsAnchorV == 2
+    var parts: [El] = [
+        iconSmall(appGlyph(a), C_ACCENT_HI),
+        label(truncate(appName(a), 32), F_SMALL, C_TEXT)
+    ]
+    if apps.len() > 1 { parts.push(badge("{apps.len()}", TONE_ACCENT)) }
+    parts.push(iconSmall(I_WIN_MAX, C_FAINT))
+    let pill = clickable(st().row().alignTo(CENTER).gapOf(8).padXY(12, 7).round(18).fill(C_PANEL_HI).hover(C_PANEL_TOP).outline(0xffffff14, 1).shadowed(14), parts, fn() { appsShown = true })
+    let place = st().at(if right { 0 - 1 } else { APPS_MARGIN + 4 }, if bottom { 0 - 1 } else { APPS_TOP + 4 }, if right { APPS_MARGIN + 4 } else { 0 - 1 }, if bottom { 96 } else { 0 - 1 })
+    return presence("apps-pill", ENTER_RISE, box(place, [withTip(pill, "Show the app window")]))
+}

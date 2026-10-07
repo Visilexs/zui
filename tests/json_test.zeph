@@ -1,0 +1,41 @@
+import "../lib/json.zeph"
+
+test "parse and read" {
+    let v = parseJsonText("\{\"type\":\"message_update\",\"n\":-12.5e1,\"ok\":true,\"list\":[1,2,\{\"a\":null\}],\"s\":\"a\\\"b\\\\n\\u00e9\\ud83d\\ude00\"\}").get()
+    assert(v.at("type").asStr() == "message_update")
+    assert(v.at("n").asNum() == -125.0)
+    assert(v.at("ok").asBool())
+    assert(v.at("list").list().len() == 3)
+    assert(v.at("list").list()[2].at("a").isNull())
+    assert(v.at("missing").isNull())
+    assert(v.at("s").asStr() == "a\"b\\n" + "é" + "😀")
+}
+
+test "malformed input is none" {
+    assert(not parseJsonText("\{\"a\":").has())
+    assert(not parseJsonText("[1,2").has())
+    assert(not parseJsonText("\"unterminated").has())
+    assert(not parseJsonText("nul").has())
+    assert(not parseJsonText("").has())
+}
+
+test "encode round trip" {
+    let v = jobj(["type", "message", "id"], [jstr("prompt"), jstr("line1\nq\"uote\t\\ é"), jnum(7.0)])
+    let text = jsonEncode(v)
+    assert(text == "\{\"type\":\"prompt\",\"message\":\"line1\\nq\\\"uote\\t\\\\ é\",\"id\":7\}", text)
+    assert(parseJsonText(text).get().at("message").asStr() == "line1\nq\"uote\t\\ é")
+}
+
+test "partial fields of streaming arguments" {
+    let f = partialJsonFields("\{\"path\": \"a.py\", \"edits\": [\{\"oldText\":\"x = 1\",\"newText\":\"x = \\\"tw")
+    assert(f.len() == 3, "{f.len()}")
+    assert(f[0].key == "path" and f[0].value == "a.py" and f[0].complete)
+    assert(f[1].key == "oldText" and f[1].value == "x = 1" and f[1].complete)
+    assert(f[2].key == "newText" and f[2].value == "x = \"tw" and not f[2].complete)
+    let cut = partialJsonFields("\{\"content\":\"line\\")
+    assert(cut.len() == 1 and cut[0].value == "line" and not cut[0].complete)
+    let keyOnly = partialJsonFields("\{\"path\":\"p\",\"cont")
+    assert(keyOnly.len() == 1)
+    let nested = partialJsonFields("\{\"n\": 3, \"s\": \"v\"\}")
+    assert(nested.len() == 1 and nested[0].key == "s")
+}

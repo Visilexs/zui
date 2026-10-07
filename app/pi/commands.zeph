@@ -1,0 +1,279 @@
+// Slash commands. The CLI's built-ins are handled here (natively where RPC
+// allows, otherwise by opening pi's terminal UI on the same session);
+// extension commands, prompt templates and skills go to pi as prompts.
+import "model.zeph"
+
+struct CommandInfo { name: str, args: str, description: str, source: str }
+
+fn builtinCommands() -> [CommandInfo] {
+    return [
+        CommandInfo{name: "model", args: "[provider/model]", description: "Select a model", source: "builtin"},
+        CommandInfo{name: "thinking", args: "[level]", description: "Set the thinking level", source: "builtin"},
+        CommandInfo{name: "new", args: "", description: "Start a new session", source: "builtin"},
+        CommandInfo{name: "resume", args: "", description: "Switch to another saved session", source: "builtin"},
+        CommandInfo{name: "name", args: "[name]", description: "Set the session display name", source: "builtin"},
+        CommandInfo{name: "session", args: "", description: "Show session information and statistics", source: "builtin"},
+        CommandInfo{name: "tree", args: "", description: "Browse the session tree", source: "builtin"},
+        CommandInfo{name: "fork", args: "", description: "New session from an earlier user message", source: "builtin"},
+        CommandInfo{name: "clone", args: "", description: "Duplicate the session at its current position", source: "builtin"},
+        CommandInfo{name: "compact", args: "[instructions]", description: "Compact the context, optionally with instructions", source: "builtin"},
+        CommandInfo{name: "import", args: "<path>", description: "Import and resume a JSONL session", source: "builtin"},
+        CommandInfo{name: "copy", args: "", description: "Copy the last assistant message", source: "builtin"},
+        CommandInfo{name: "export", args: "[path]", description: "Export the session as HTML (or JSONL with a .jsonl path)", source: "builtin"},
+        CommandInfo{name: "settings", args: "", description: "Open settings", source: "builtin"},
+        CommandInfo{name: "hotkeys", args: "", description: "Show keyboard shortcuts", source: "builtin"},
+        CommandInfo{name: "reload", args: "", description: "Reload extensions, skills, templates and context files", source: "builtin"},
+        CommandInfo{name: "scoped-models", args: "", description: "Configure models for cycling (terminal)", source: "terminal"},
+        CommandInfo{name: "login", args: "[provider]", description: "Add provider authentication (terminal)", source: "terminal"},
+        CommandInfo{name: "logout", args: "", description: "Remove provider authentication (terminal)", source: "terminal"},
+        CommandInfo{name: "llama", args: "", description: "Manage llama.cpp router models (terminal)", source: "terminal"},
+        CommandInfo{name: "trust", args: "", description: "Save a project trust decision (terminal)", source: "terminal"},
+        CommandInfo{name: "share", args: "", description: "Upload the session and get a link (terminal)", source: "terminal"},
+        CommandInfo{name: "bug", args: "[description]", description: "Prepare a bug report (terminal)", source: "terminal"},
+        CommandInfo{name: "changelog", args: "", description: "Show changelog entries (terminal)", source: "terminal"},
+        CommandInfo{name: "quit", args: "", description: "Quit", source: "builtin"}
+    ]
+}
+
+// every command: built-ins, then what pi reported (extensions, prompts, skills)
+fn allCommands() -> [CommandInfo] {
+    var out = builtinCommands()
+    for c in S.commands {
+        out.push(CommandInfo{name: c.at("name").asStr(), args: "", description: c.at("description").asStr(), source: c.at("source").asStr()})
+    }
+    return out
+}
+
+fn expandPath(path: str) -> str {
+    if path.startsWith("~/") { return S.home + path.sub(1, path.len()) }
+    if path.startsWith("/") { return path }
+    return S.cwd + "/" + path
+}
+
+fn lastAssistantText() -> str {
+    var i = S.messages.len() - 1
+    while i >= 0 {
+        let m = S.messages[i]
+        if m.role == "assistant" {
+            var parts: [str] = []
+            for b in m.blocks {
+                if b.kind == BlockKind.Text and b.text.trim() != "" { parts.push(b.text) }
+            }
+            if parts.len() > 0 { return parts.join("\n\n") }
+        }
+        i -= 1
+    }
+    return ""
+}
+
+fn copyLastAssistant() {
+    let t = lastAssistantText()
+    if t == "" {
+        toast("No assistant message to copy", "info")
+        return
+    }
+    copyText(t)
+    toast("Copied the last response", "info")
+}
+
+fn openPanel(kind: str) {
+    S.panel = kind
+    S.panelQuery = ""
+    S.panelIndex = 0
+    if kind == "session" { send(command("get_session_stats")) }
+    if kind == "fork" { send(command("get_fork_messages")) }
+    if kind == "tree" { send(command("get_tree")) }
+    if kind == "resume" { refreshSessions() }
+    if kind == "rename" { S.panelQuery = S.sessionName }
+    requestFocus("panel-input")
+    invalidate()
+}
+
+fn closePanel() {
+    S.panel = ""
+    S.panelQuery = ""
+    requestFocus("composer")
+    invalidate()
+}
+
+// true when the desktop handled the command (otherwise it goes to pi)
+fn runBuiltinCommand(message: str) -> bool {
+    let body = message.sub(1, message.len())
+    let space = body.indexOf(" ")
+    let name = if space < 0 { body } else { body.sub(0, space) }
+    let arg = if space < 0 { "" } else { body.sub(space + 1, body.len()).trim() }
+    if name == "model" {
+        if arg == "" { openPanel("model") }
+        else {
+            let slash = arg.indexOf("/")
+            if slash > 0 { chooseModel(arg.sub(0, slash), arg.sub(slash + 1, arg.len())) }
+            else {
+                for m in S.models {
+                    if m.at("id").asStr() == arg { chooseModel(m.at("provider").asStr(), arg) }
+                }
+            }
+        }
+        return true
+    }
+    if name == "thinking" {
+        if arg == "" { openPanel("thinking") } else { chooseThinking(arg) }
+        return true
+    }
+    if name == "new" {
+        newSession()
+        return true
+    }
+    if name == "resume" {
+        openPanel("resume")
+        return true
+    }
+    if name == "name" {
+        if arg == "" { openPanel("rename") }
+        else { send(jobj(["type", "name"], [jstr("set_session_name"), jstr(arg)])) }
+        return true
+    }
+    if name == "session" or name == "tree" or name == "fork" or name == "settings" or name == "hotkeys" {
+        openPanel(name)
+        return true
+    }
+    if name == "clone" {
+        send(command("clone"))
+        return true
+    }
+    if name == "compact" {
+        var fields = command("compact")
+        if arg != "" { fields = fields.set("customInstructions", jstr(arg)) }
+        send(fields)
+        S.compacting = true
+        return true
+    }
+    if name == "import" {
+        if arg == "" { toast("Usage: /import <path to session .jsonl>", "warning") }
+        else { send(jobj(["type", "sessionPath"], [jstr("switch_session"), jstr(expandPath(arg))])) }
+        return true
+    }
+    if name == "copy" {
+        copyLastAssistant()
+        return true
+    }
+    if name == "export" {
+        if arg.endsWith(".jsonl") {
+            if S.sessionFile == "" { toast("This session is not saved", "warning") }
+            else {
+                writeFile(expandPath(arg), readFile(S.sessionFile))
+                toast("Exported to " + expandPath(arg), "info")
+            }
+        } else {
+            var fields = command("export_html")
+            if arg != "" { fields = fields.set("outputPath", jstr(expandPath(arg))) }
+            send(fields)
+        }
+        return true
+    }
+    if name == "reload" {
+        var extra: [str] = []
+        if S.sessionFile != "" {
+            extra.push("--session")
+            extra.push(S.sessionFile)
+        }
+        toast("Reloading pi…", "info")
+        restartPi(extra)
+        return true
+    }
+    if name == "quit" or name == "exit" {
+        quit()
+        return true
+    }
+    for c in builtinCommands() {
+        if c.name == name and c.source == "terminal" {
+            openTerminal(message)
+            return true
+        }
+    }
+    return false
+}
+
+// ---- terminals ----
+
+fn terminalCommand() -> [str] {
+    let custom = envVar("PI_DESK_TERMINAL")
+    if custom != "" { return custom.split(" ") }
+    return ["kitty", "--class", "pi-desk-terminal", "--directory", S.cwd]
+}
+
+// run pi's terminal UI on this session; the RPC pi steps aside meanwhile, and
+// comes back on the same session when the terminal closes
+fn openTerminal(hint: str) {
+    var argv = terminalCommand()
+    argv.push("--")
+    for a in S.piCommand { argv.push(a) }
+    if S.sessionFile != "" {
+        argv.push("--session")
+        argv.push(S.sessionFile)
+    }
+    stopPi()
+    S.terminalProc = procSpawn(argv)
+    if let p = S.terminalProc { appsExclude(p.pid) }
+    if not S.terminalProc.has() {
+        toast("Could not start a terminal (set PI_DESK_TERMINAL)", "error")
+        restartPi(sessionArgs())
+        return
+    }
+    S.panel = "terminal"
+    S.panelArg = hint
+    invalidate()
+}
+
+fn sessionArgs() -> [str] {
+    var extra: [str] = []
+    if S.sessionFile != "" {
+        extra.push("--session")
+        extra.push(S.sessionFile)
+    }
+    return extra
+}
+
+// Ctrl+G: edit the prompt in $VISUAL / $EDITOR inside a terminal
+fn openExternalEditor() {
+    if S.editorProc.has() { return }
+    var editor = envVar("VISUAL")
+    if editor == "" { editor = envVar("EDITOR") }
+    if editor == "" { editor = "nvim" }
+    S.editorFile = "/tmp/pi-desk-prompt-{syscall(39)}.md"
+    writeFile(S.editorFile, S.composer)
+    var argv = terminalCommand()
+    argv.push("--")
+    for part in editor.split(" ") { argv.push(part) }
+    argv.push(S.editorFile)
+    S.editorProc = procSpawn(argv)
+    if let p = S.editorProc { appsExclude(p.pid) }
+    if not S.editorProc.has() { toast("Could not open an editor terminal", "error") }
+    else { toast("Editing in " + editor + " — save and quit to return", "info") }
+}
+
+// called from tick: finish external editors and terminal sessions
+fn pollChildren() {
+    if let p = S.editorProc {
+        let drained = procLines(p)
+        if procPoll(p) {
+            S.editorProc = none
+            if fileExists(S.editorFile) {
+                var t = readFile(S.editorFile)
+                while t.endsWith("\n") { t = t.sub(0, t.len() - 1) }
+                S.composer = t
+                let removed = deleteFile(S.editorFile)
+            }
+            requestFocus("composer")
+            invalidate()
+        }
+    }
+    if let p = S.terminalProc {
+        let drained = procLines(p)
+        if procPoll(p) {
+            S.terminalProc = none
+            if S.panel == "terminal" { S.panel = "" }
+            restartPi(sessionArgs())
+            refreshSessions()
+        }
+    }
+}

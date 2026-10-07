@@ -1,0 +1,159 @@
+// The memory vault (pi's memory-vault extension keeps one Markdown file per
+// preference in ~/.pi/agent/memory): browse it in the dock, open an entry in
+// an editor, delete one, or ask pi to remember something new.
+import "view.zeph"
+
+struct MemEntry { slug: str, path: str, title: str, category: str, scope: str, updated: str, body: str }
+
+var memEntries: [MemEntry] = []
+var memLoadedAt = 0
+var memFilter = ""
+
+fn memoryDir() -> str { return S.home + "/.pi/agent/memory" }
+
+fn memParse(path: str, slug: str) -> MemEntry {
+    var e = MemEntry{slug: slug, path: path, title: slug, category: "other", scope: "global", updated: "", body: ""}
+    let raw = readFile(path)
+    if not raw.startsWith("---\n") {
+        e.body = raw.trim()
+        return e
+    }
+    let close = raw.sub(4, raw.len()).indexOf("\n---")
+    if close < 0 { return e }
+    for line in raw.sub(4, 4 + close).split("\n") {
+        let at = line.indexOf(":")
+        if at <= 0 { continue }
+        var value = line.sub(at + 1, line.len()).trim()
+        if value.startsWith("\"") and value.endsWith("\"") and value.len() >= 2 { value = value.sub(1, value.len() - 1).replace("\\\"", "\"") }
+        let key = line.sub(0, at).trim()
+        if key == "title" { e.title = value }
+        else if key == "category" { e.category = value }
+        else if key == "scope" { e.scope = value }
+        else if key == "updated" { e.updated = value }
+    }
+    e.body = raw.sub(min(4 + close + 4, raw.len()), raw.len()).trim()
+    return e
+}
+
+// re-read the folder at most every 1.5 s while the tab is open
+fn memRefresh(force: bool) {
+    let now = nowMs()
+    if not force and now - memLoadedAt < 1500 { return }
+    memLoadedAt = now
+    var list: [MemEntry] = []
+    for d in readDir(memoryDir()) {
+        if d.isDir or not d.name.endsWith(".md") { continue }
+        list.push(memParse(memoryDir() + "/" + d.name, d.name.sub(0, d.name.len() - 3)))
+    }
+    // by category, then title
+    var keys: [str] = []
+    for e in list { keys.push(e.category + "\x01" + e.title.lower() + "\x01" + e.slug) }
+    keys.sort()
+    var sorted: [MemEntry] = []
+    for k in keys {
+        for e in list {
+            if e.category + "\x01" + e.title.lower() + "\x01" + e.slug == k { sorted.push(e) }
+        }
+    }
+    memEntries = sorted
+}
+
+fn memForget(e: MemEntry) {
+    syscall(87, cstr(e.path))                  // unlink
+    memRefresh(true)
+    toast("Forgot: " + e.title, "info")
+}
+
+fn memEdit(e: MemEntry) {
+    var editor = envVar("VISUAL")
+    if editor == "" { editor = envVar("EDITOR") }
+    if editor == "" { editor = "vim" }
+    var argv = terminalCommand()
+    argv.push("--")
+    for part in editor.split(" ") { argv.push(part) }
+    argv.push(e.path)
+    let p = procSpawn(argv)
+    if not p.has() { toast("Could not open an editor", "error") }
+}
+
+fn memCategoryGlyph(c: str) -> str {
+    if c == "design" { return I_MAGIC }
+    if c == "code" { return I_CODE }
+    if c == "writing" { return I_COMMENT }
+    if c == "workflow" { return I_LIST }
+    if c == "tools" { return I_PUZZLE }
+    if c == "personal" { return I_USER }
+    return I_TAG
+}
+
+fn memItem(e: MemEntry) -> El {
+    let entry = e
+    var preference = e.body
+    var why = ""
+    let at = e.body.indexOf("**Why:**")
+    if at >= 0 {
+        preference = e.body.sub(0, at).trim()
+        why = e.body.sub(at + 8, e.body.len()).trim()
+        let how = why.indexOf("**How to apply:**")
+        if how >= 0 { why = why.sub(0, how).trim() + "  ·  " + why.sub(how + 17, why.len()).trim() }
+    }
+    var meta: [El] = []
+    if e.scope != "global" and e.scope != "" { meta.push(badge("this project", TONE_ACCENT)) }
+    if e.updated != "" { meta.push(label(e.updated, F_SMALL, C_FAINT)) }
+    var body: [El] = [
+        box(st().row().alignTo(CENTER).gapOf(8), [
+            box(st().flex(1), [label(e.title, F_UI_BOLD, C_TEXT)]),
+            withHoverOnly(box(st().row().gapOf(2), [
+                iconBtnSmall(I_EDIT, "Edit in your editor", C_MUTED, fn() { memEdit(entry) }),
+                iconBtnSmall(I_TRASH, "Forget this", C_MUTED, fn() { memForget(entry) })
+            ]))
+        ]),
+        label(preference, F_SMALL, C_TEXT_SOFT)
+    ]
+    if why != "" { body.push(label(why, F_SMALL, C_FAINT)) }
+    if meta.len() > 0 { body.push(box(st().row().alignTo(CENTER).gapOf(8).padTo(0, 2, 0, 0), meta)) }
+    return withKey(asHoverGroup(box(st().gapOf(4).padXY(12, 10).round(10).fill(C_PANEL).outline(0xffffff0a, 1), body)), e.slug)
+}
+
+fn memoryTab() -> El {
+    memRefresh(false)
+    let filter = memFilter.lower()
+    var items: [El] = []
+    var lastCategory = ""
+    var shown = 0
+    for e in memEntries {
+        if filter != "" and (e.title + " " + e.body + " " + e.category).lower().indexOf(filter) < 0 { continue }
+        if e.category != lastCategory {
+            lastCategory = e.category
+            items.push(box(st().row().alignTo(CENTER).gapOf(7).padTo(2, if shown == 0 { 0 } else { 10 }, 0, 2), [
+                iconSmall(memCategoryGlyph(e.category), C_FAINT), label(e.category.upper(), F_SMALL_BOLD, C_FAINT)
+            ]))
+        }
+        items.push(memItem(e))
+        shown += 1
+    }
+    if memEntries.len() == 0 {
+        items.push(box(st().gapOf(8).padXY(6, 10), [
+            label("Nothing remembered yet.", F_UI, C_MUTED),
+            label("Tell pi what you like or dislike (\"I prefer…\", \"too cramped\", \"never use…\") and it saves the preference here, then follows it in every session.", F_SMALL, C_FAINT)
+        ]))
+    } else if shown == 0 {
+        items.push(box(st().padXY(6, 10), [label("No memories match.", F_SMALL, C_FAINT)]))
+    }
+    let search = input("memory-filter", st().padXY(2, 6).fontOf(F_UI).fg(C_TEXT), memFilter, "Search memories",
+        fn(t: str) { memFilter = t }, fn(t: str) { })
+    return box(st().flex(1).padTo(14, 12, 14, 12).gapOf(10), [
+        box(st().row().alignTo(CENTER).gapOf(8), [
+            box(st().flex(1).gapOf(2), [
+                label("Memory vault", F_H2, C_TEXT),
+                label("{memEntries.len()} preferences pi follows in every session", F_SMALL, C_FAINT)
+            ]),
+            withTip(buttonIcon(I_PLUS, "Add", BTN_SECONDARY, fn() {
+                S.composer = "Remember: "
+                requestFocus("composer")
+            }), "Tell pi something to remember")
+        ]),
+        box(st().row().alignTo(CENTER).gapOf(8).padTo(10, 0, 4, 0).fill(C_PANEL).round(8), [iconSmall(I_SEARCH, C_FAINT), box(st().flex(1), [search])]),
+        scroll("memory-list", st().flex(1).gapOf(8).padTo(0, 0, 6, 0), items, false)
+    ])
+}

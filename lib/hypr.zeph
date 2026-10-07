@@ -1,0 +1,56 @@
+// Hyprland's IPC socket: one request, one reply. Hyprland 0.56 takes Lua
+// ("repl <code>" returns what the code returns).
+import "ffi.zeph"
+
+fn hyprSocket() -> str {
+    let signature = envVar("HYPRLAND_INSTANCE_SIGNATURE")
+    if signature == "" { return "" }
+    var runtime = envVar("XDG_RUNTIME_DIR")
+    if runtime == "" { runtime = "/run/user/{syscall(102)}" }
+    return runtime + "/hypr/" + signature + "/.socket.sock"
+}
+
+var hyprBuffer = 0
+
+// the reply, or "" when Hyprland isn't there
+fn hyprRequest(request: str) -> str {
+    let path = hyprSocket()
+    if path == "" or path.len() > 107 { return "" }
+    let fd = syscall(41, 1, 1 | 524288, 0)              // socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC)
+    if fd < 0 { return "" }
+    let address = nativeAlloc(112)
+    store8(address, 1)                                  // sun_family = AF_UNIX
+    store8(address + 1, 0)
+    memcpy(address + 2, strData(path), path.len())
+    store8(address + 2 + path.len(), 0)
+    let timeout = nativeAlloc(16)                       // 1 s, so a stuck compositor can't hang the UI
+    store64(timeout, 1)
+    store64(timeout + 8, 0)
+    syscall(54, fd, 1, 20, timeout, 16)                 // setsockopt SO_RCVTIMEO
+    syscall(54, fd, 1, 21, timeout, 16)                 // SO_SNDTIMEO
+    if syscall(42, fd, address, 110) != 0 {
+        syscall(3, fd)
+        return ""
+    }
+    var offset = 0
+    let base = strData(request)
+    while offset < request.len() {
+        let n = syscall(1, fd, base + offset, request.len() - offset)
+        if n == 0 - 4 { continue }
+        if n <= 0 { break }
+        offset += n
+    }
+    syscall(48, fd, 1)                                  // shutdown(SHUT_WR)
+    if hyprBuffer == 0 { hyprBuffer = nativeAlloc(65536) }
+    var parts: [str] = []
+    while true {
+        let n = syscall(0, fd, hyprBuffer, 65536)
+        if n == 0 - 4 { continue }
+        if n <= 0 { break }
+        parts.push(strFrom(hyprBuffer, n))
+    }
+    syscall(3, fd)
+    return parts.join()
+}
+
+fn hyprLua(code: str) -> str { return hyprRequest("repl " + code) }

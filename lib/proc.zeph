@@ -24,10 +24,12 @@ var procReadBuffer = 0
 var procStatus = 0
 var procTracked: [int: bool] = [:]        // children a Proc waits for itself
 
+var procFds = 0
+
 fn procPipe() -> (int, int) {
-    let fds = nativeAlloc(8)
-    if syscall(293, fds, O_CLOEXEC) != 0 { panic("pipe2 failed") }
-    return (load32(fds), load32(fds + 4))
+    if procFds == 0 { procFds = nativeAlloc(8) }
+    if syscall(293, procFds, O_CLOEXEC) != 0 { panic("pipe2 failed") }
+    return (load32(procFds), load32(procFds + 4))
 }
 
 fn procEnviron() -> int {
@@ -53,6 +55,12 @@ fn procSpawn(argv: [str]) -> Proc? {
     store64(vector + 8 * argv.len(), 0)
     let pidOut = nativeAlloc(8)
     let rc = posix_spawnp(pidOut, load64(vector), actions, 0, vector, procEnviron())
+    let pid = load32(pidOut)
+    posix_spawn_file_actions_destroy(actions)
+    for i in 0..argv.len() { nativeFree(load64(vector + 8 * i)) }
+    nativeFree(vector)
+    nativeFree(pidOut)
+    nativeFree(actions)
     syscall(3, inRead)
     syscall(3, outWrite)
     syscall(3, errWrite)
@@ -65,8 +73,8 @@ fn procSpawn(argv: [str]) -> Proc? {
     syscall(72, outRead, 4, O_NONBLOCK)         // fcntl F_SETFL
     syscall(72, errRead, 4, O_NONBLOCK)
     if procReadBuffer == 0 { procReadBuffer = nativeAlloc(65536) }
-    procTracked[load32(pidOut)] = true
-    return Proc{pid: load32(pidOut), stdinFd: inWrite, stdoutFd: outRead, stderrFd: errRead}
+    procTracked[pid] = true
+    return Proc{pid: pid, stdinFd: inWrite, stdoutFd: outRead, stderrFd: errRead}
 }
 
 // whatever is available now, without blocking; "" when nothing

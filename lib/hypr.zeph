@@ -11,6 +11,8 @@ fn hyprSocket() -> str {
 }
 
 var hyprBuffer = 0
+var hyprAddress = 0               // sockaddr_un, reused: hyprRequest runs several times a second
+var hyprTimeout = 0
 
 // the reply, or "" when Hyprland isn't there
 fn hyprRequest(request: str) -> str {
@@ -18,12 +20,14 @@ fn hyprRequest(request: str) -> str {
     if path == "" or path.len() > 107 { return "" }
     let fd = syscall(41, 1, 1 | 524288, 0)              // socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC)
     if fd < 0 { return "" }
-    let address = nativeAlloc(112)
+    if hyprAddress == 0 { hyprAddress = nativeAlloc(112) }
+    let address = hyprAddress
     store8(address, 1)                                  // sun_family = AF_UNIX
     store8(address + 1, 0)
     memcpy(address + 2, strData(path), path.len())
     store8(address + 2 + path.len(), 0)
-    let timeout = nativeAlloc(16)                       // 1 s, so a stuck compositor can't hang the UI
+    if hyprTimeout == 0 { hyprTimeout = nativeAlloc(16) }
+    let timeout = hyprTimeout                           // 1 s, so a stuck compositor can't hang the UI
     store64(timeout, 1)
     store64(timeout + 8, 0)
     syscall(54, fd, 1, 20, timeout, 16)                 // setsockopt SO_RCVTIMEO

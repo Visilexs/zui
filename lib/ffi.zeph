@@ -66,6 +66,7 @@ extern fn FcPatternGetInteger(pattern: int, object: int, n: int, out: int) -> i3
 extern fn posix_spawnp(pid: int, file: int, actions: int, attributes: int, argv: int, envp: int) -> i32 from "libc.so.6"
 extern fn posix_spawn_file_actions_init(actions: int) -> i32 from "libc.so.6"
 extern fn posix_spawn_file_actions_adddup2(actions: int, fd: int, target: int) -> i32 from "libc.so.6"
+extern fn posix_spawn_file_actions_destroy(actions: int) -> i32 from "libc.so.6"
 extern fn signal(number: int, handler: int) -> int from "libc.so.6"
 extern fn memcpy(target: int, source: int, n: int) -> int from "libc.so.6"
 extern fn strlen(text: int) -> int from "libc.so.6"
@@ -144,7 +145,12 @@ const FT_LOAD_TARGET_LIGHT = 65536
 // ---- memory and strings ----
 
 // off-heap memory (never freed): buffers C keeps or writes into
+// off-heap memory: each call maps n bytes plus a header page (8 KiB resident at
+// least) that stays until nativeFree, so allocate long-lived buffers once
 fn nativeAlloc(n: int) -> int { return win("VirtualAlloc", 0, n, 12288, 4) }
+fn nativeFree(p: int) {
+    if p != 0 { let released = win("VirtualFree", p, 0, 32768) }     // MEM_RELEASE
+}
 
 // a NUL-terminated copy of `text` in a reusable off-heap slot; valid until
 // the same slot is used again

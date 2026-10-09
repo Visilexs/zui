@@ -219,6 +219,10 @@ struct El {
     animated: bool = false       // keeps redrawing every frame (spinners)
     portal: bool = false         // drawn above everything else, outside ancestors' clips
     image: int = 0               // an image id (gfx imageLoadBMP) drawn to fill the box
+    memoHit: bool = false        // memo: this subtree is reused unchanged from the last rebuild
+    memoW: int = 0 - 1           // memo: the width/height constraint and scale it was laid out at
+    memoH: int = 0 - 1
+    memoScale: float = 0.0
     x: int = 0
     y: int = 0
     w: int = 0
@@ -378,6 +382,38 @@ fn presence(key: str, enter: int, el: El) -> El {
     el.enter = enter
     return el
 }
+// React.memo, scaled down: memo(key, version, build) returns the subtree built
+// last time while `version` is unchanged. Reconcile skips it and layout only
+// shifts it to its new position, so a long list of settled items (a chat
+// transcript) costs almost nothing per rebuild. `version` must change whenever
+// anything the subtree shows changes, including state its closures read at build.
+struct MemoEntry { version: str, el: El, gen: int }
+var memoCache: [str: MemoEntry] = [:]
+var memoGen = 0
+
+fn memo(key: str, version: str, build: fn() -> El) -> El {
+    if let entry = memoCache.get(key) {
+        if entry.version == version {
+            entry.gen = memoGen
+            entry.el.memoHit = true
+            return entry.el
+        }
+    }
+    let el = build()
+    el.key = key
+    memoCache[key] = MemoEntry{version: version, el: el, gen: memoGen}
+    return el
+}
+
+// drop entries no rebuild has asked for lately (removed messages)
+fn memoPrune() {
+    var stale: [str] = []
+    for key, entry in memoCache {
+        if memoGen - entry.gen > 2 { stale.push(key) }
+    }
+    for key in stale { memoCache.remove(key) }
+}
+
 // AnimatePresence-style exit: when this keyed element leaves the tree it keeps
 // being drawn while its exit transition plays, then is removed
 fn exitFade(el: El) -> El {
@@ -460,6 +496,15 @@ fn newInst(el: El) -> Inst {
 }
 
 fn reconcile(el: El, old: Inst?) -> Inst {
+    if el.memoHit {
+        if let previous = old {
+            if let mine = el.inst {
+                if mine.id == previous.id { return previous }
+            }
+        }
+        // matched to different instances: they need a full layout pass
+        el.memoHit = false
+    }
     var inst = newInst(el)
     if let previous = old {
         if previous.tag == el.tag and previous.key == el.key { inst = previous }
@@ -771,6 +816,13 @@ fn measureW(el: El, limit: int) -> int {
 // position el at (x, y) with width w; h < 0 means "as tall as the content".
 // Returns the height used.
 fn layout(el: El, x: int, y: int, w: int, h: int) -> int {
+    if el.memoHit {
+        el.memoHit = false
+        if el.memoW == w and el.memoH == h and el.memoScale == uiScale {
+            if x != el.x or y != el.y { shiftXY(el, x - el.x, y - el.y) }
+            return el.h
+        }
+    }
     let s = el.style
     el.x = x
     el.y = y
@@ -843,6 +895,9 @@ fn layout(el: El, x: int, y: int, w: int, h: int) -> int {
     if h >= 0 { total = h }
     total = clampH(s, total)
     el.h = total
+    el.memoW = w
+    el.memoH = h
+    el.memoScale = uiScale
     if el.tag == Tag.Scroll {
         let inst = el.inst.get()
         let viewport = total - vPad(s)
@@ -1736,6 +1791,8 @@ fn rebuild(app: App, givenWidth: int, height: int) {
     let width = if forcedWidth > 0 { min(givenWidth, sc(forcedWidth)) } else { givenWidth }
     viewW = ((width as float) / uiScale) as int
     viewH = ((height as float) / uiScale) as int
+    memoGen += 1
+    if memoGen % 64 == 0 { memoPrune() }
     let root = component("root", app.render)
     zuiRootInst = reconcile(root, zuiRootInst)
     zuiAnimating = false

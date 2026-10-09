@@ -671,12 +671,14 @@ fn welcomeView() -> El {
 fn chatView() -> El {
     var items: [El] = []
     if S.messages.len() == 0 and S.connected { items.push(welcomeView()) }
+    let shared = sharedMessageVersion()
     for m in S.messages {
-        var el = box(st(), [])
-        if m.role == "user" { el = userView(m) }
-        else if m.role == "assistant" { el = assistantView(m) }
-        else { el = noteView(m) }
-        items.push(presence("m{m.id}", ENTER_RISE, el))
+        let msg = m
+        if messageSettled(m) {
+            items.push(presence("m{m.id}", ENTER_RISE, memo("m{m.id}", messageVersion(m) + shared, fn() -> El { return messageView(msg) })))
+        } else {
+            items.push(presence("m{m.id}", ENTER_RISE, messageView(m)))
+        }
     }
     if S.running {
         let last = if S.messages.len() > 0 { S.messages[S.messages.len() - 1] } else { Msg{id: 0, role: ""} }
@@ -695,6 +697,37 @@ fn chatView() -> El {
     ], true)
     chat.centerShort = true          // the welcome view centres while it fits
     return chat
+}
+
+fn messageView(m: Msg) -> El {
+    if m.role == "user" { return userView(m) }
+    if m.role == "assistant" { return assistantView(m) }
+    return noteView(m)
+}
+
+// a message that no longer changes on its own: not streaming, no tool or
+// shell command still running (those tick a live timer)
+fn messageSettled(m: Msg) -> bool {
+    if m.streaming { return false }
+    if m.role == "bash" and S.bashRunning and m.id == S.bashMsgId { return false }
+    for b in m.blocks {
+        if b.kind != BlockKind.Text and b.kind != BlockKind.Thinking and b.status < 2 { return false }
+    }
+    return true
+}
+
+// memo version of one message: everything its view reads from the message
+fn messageVersion(m: Msg) -> str {
+    var v = "{m.role}|{m.text.len()}|{m.error}|{m.endedAt}|{m.images.len()}|{m.compaction}|{m.contextChars}|{m.blocks.len()}"
+    for b in m.blocks {
+        v = v + "|{b.status},{b.expanded},{b.text.len()},{b.output.len()},{b.endedAt}"
+    }
+    return v
+}
+
+// memo version shared by all messages: global state the message views read
+fn sharedMessageVersion() -> str {
+    return "|{S.showThinking}|{S.expandTools}|{S.forkMessages.len()}|{chatWidth()}|{chatWidthChoice}"
 }
 
 // ---- composer suggestions ----

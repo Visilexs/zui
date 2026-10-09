@@ -2028,6 +2028,11 @@ fn zuiRun(app: App, width: int, height: int) {
     var stepIndex = 0
     var stepWaitUntil = 0
     var stepShot = ""
+    // after a burst of work, once the app has been idle a while, hand the heap's
+    // free pages back to the OS (runtimeTrimMemory) so a quiet window doesn't
+    // keep the peak of its last burst resident
+    var lastBusyAt = SDL_GetTicks()
+    var trimmed = true
     while not zuiQuit {
         var got = SDL_WaitEventTimeout(event, if nextWait < 0 { 1000 } else { nextWait })
         while got {
@@ -2083,6 +2088,13 @@ fn zuiRun(app: App, width: int, height: int) {
         if tipText != "" and not tipDrawn and tipId != tipHiddenId and not mouseDown {
             let due = tipSince + TIP_DELAY - SDL_GetTicks()
             if due <= 0 { zuiRedraw = true } else { nextWait = if nextWait < 0 { due } else { min(nextWait, due) } }
+        }
+        if zuiDirty or zuiRedraw {
+            lastBusyAt = SDL_GetTicks()
+            trimmed = false
+        } else if not trimmed and SDL_GetTicks() - lastBusyAt > 5000 {
+            runtimeTrimMemory()
+            trimmed = true
         }
         if zuiDirty {
             zuiDirty = false

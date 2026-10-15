@@ -2488,11 +2488,6 @@ fn textPointIn(els: [El], needle: str, atEnd: bool) -> (int, int) {
 
 fn textPointOf(needle: str, atEnd: bool) -> (int, int) { return textPointIn(textOrder, needle, atEnd) }
 
-fn store16(address: int, value: int) {
-    store8(address, value & 255)
-    store8(address + 1, (value >> 8) & 255)
-}
-
 fn floatAt(p: int) -> float { return float32FromBits(load32(p)) }
 
 // set the app-wide shortcut handler (runs when the focused input doesn't take a key)
